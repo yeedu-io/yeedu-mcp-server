@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "yeedu-mcp-server"
+version = "0.1.0"
+description = "Yeedu MCP Server — exposes the Yeedu data platform to AI agents via Model Context Protocol"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp[cli]>=1.9.2",
+    "httpx==0.28.1",
+    "pydantic>=2",
+    "pydantic-settings>=2",
+    "python-dotenv>=1",
+    "anyio",
+    "tenacity>=8.0.0",
+]
+
+[project.scripts]
+yeedu-mcp-server = "yeedu_mcp_server.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/yeedu_mcp_server"]
+
+[dependency-groups]
+dev = [
+    "watchfiles>=1.2.0",
+]
