@@ -35,6 +35,7 @@ import yeedu_mcp_server.tools.billing  # noqa: F401
 import yeedu_mcp_server.tools.cluster       # noqa: F401
 import yeedu_mcp_server.tools.workspace     # noqa: F401
 import yeedu_mcp_server.tools.spark_job     # noqa: F401
+import yeedu_mcp_server.tools.notebook     # noqa: F401
 import yeedu_mcp_server.tools.metastore     # noqa: F401
 import yeedu_mcp_server.tools.git           # noqa: F401
 import yeedu_mcp_server.tools.storage       # noqa: F401

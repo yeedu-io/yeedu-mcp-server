@@ -16,6 +16,7 @@ dependencies = [
     "python-dotenv>=1",
     "anyio",
     "tenacity>=8.0.0",
+    "websockets>=12",
 ]
 
 [project.scripts]

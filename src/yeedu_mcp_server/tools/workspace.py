@@ -1,6 +1,6 @@
 """Workspace, file management, and permissions tools for Yeedu MCP Server."""
 import json
-from typing import List, Optional
+from typing import Any, List, Optional
 from pydantic import Field
 from yeedu_mcp_server.client import YeeduClient
 from yeedu_mcp_server.utils.formatting import serialize_table
@@ -366,9 +366,9 @@ async def upload_workspace_file(
         default=None,
         description="The target directory prefix for uploaded file(s). should start with '/'",
     ),
-    file_content: Optional[str] = Field(
+    file_content: Optional[Any] = Field(
         default=None,
-        description="The content of the file to be uploaded as a decoded readable string. Required for files (is_dir=False). Omit for directories.",
+        description="The content of the file to be uploaded as a decoded readable string. JSON content (e.g. .ipynb notebooks) may be passed as a string or as a JSON object. Required for files (is_dir=False). Omit for directories.",
     ),
 ) -> str:
     """Upload/create file or directory in workspace at specified path. Supports overwrite mode, directory creation, and target directory specification. Returns success confirmation."""
@@ -397,8 +397,11 @@ async def upload_workspace_file(
             else:
                 if file_content is None:
                     return "Error: file_content is required when creating/uploading a file (is_dir=False)."
+                # MCP clients may auto-parse JSON-looking strings (e.g. .ipynb) into dict/list
+                if not isinstance(file_content, str):
+                    file_content = json.dumps(file_content, indent=1)
                 headers = {
-                    "x-file-size": str(len(file_content)),
+                    "x-file-size": str(len(file_content.encode("utf-8"))),
                     "Content-Type": "application/octet-stream",
                 }
                 await client.post(

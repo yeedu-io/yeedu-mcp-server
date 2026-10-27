@@ -814,6 +814,144 @@ async def create_job(
 
 
 @mcp.tool(
+    description="Creates a new notebook configuration in a workspace. Required: workspace_id, notebook_name, notebook_type (python3/scala/sql). Optional: cluster_id or cluster_name to attach a cluster, notebook_path (directory inside the workspace files), Spark conf/packages/jars/files, driver/executor resources, max_concurrency, should_append_params. Returns the created notebook details."
+)
+async def create_notebook(
+    workspace_id: int = Field(
+        description="Workspace ID where the notebook will be created"),
+    notebook_name: str = Field(min_length=1, description="Notebook name"),
+    notebook_type: str = Field(
+        description="Notebook type: python3, scala, or sql"),
+    cluster_id: Optional[int] = Field(
+        default=None, description="ID of the cluster to attach to the notebook"),
+    cluster_name: Optional[str] = Field(
+        default=None, description="Name of the cluster to attach (alternative to cluster_id)"),
+    notebook_path: Optional[str] = Field(
+        default=None, description="Path inside the workspace files where the notebook is created, e.g. '/foo/bar'"),
+    max_concurrency: Optional[int] = Field(
+        default=None, ge=0, description="Maximum concurrent notebook runs (default 1)"),
+    conf: Optional[List[str]] = Field(
+        default=None, description="Spark conf key-value pairs"),
+    packages: Optional[List[str]] = Field(
+        default=None, description="List of Spark packages"),
+    jars: Optional[List[str]] = Field(
+        default=None, description="List of jar files"),
+    files: Optional[List[str]] = Field(
+        default=None, description="List of file paths"),
+    driver_memory: Optional[str] = Field(
+        default=None, description="Memory allocated to Spark driver"),
+    executor_memory: Optional[str] = Field(
+        default=None, description="Memory allocated to executors"),
+    driver_cores: Optional[int] = Field(
+        default=None, ge=1, description="Number of cores for driver"),
+    executor_cores: Optional[int] = Field(
+        default=None, ge=1, description="Number of cores per executor"),
+    num_executors: Optional[int] = Field(
+        default=None, ge=1, description="Total number of executors"),
+    total_executor_cores: Optional[int] = Field(
+        default=None, ge=1, description="Total number of executor cores"),
+    should_append_params: Optional[bool] = Field(
+        default=None, description="Append job Spark configuration to the cluster-level configuration instead of overriding it"),
+) -> str:
+    """Create a notebook, optionally attached to a cluster"""
+    try:
+        notebook_type = notebook_type.lower()
+        if notebook_type not in ("python3", "scala", "sql"):
+            return f"Error: Invalid notebook_type '{notebook_type}'. Must be one of: python3, scala, sql."
+
+        body = {
+            "notebook_name": notebook_name,
+            "notebook_type": notebook_type,
+            "cluster_id": cluster_id,
+            "cluster_name": cluster_name,
+            "notebook_path": notebook_path,
+            "max_concurrency": max_concurrency,
+            "conf": conf,
+            "packages": packages,
+            "jars": jars,
+            "files": files,
+            "driver_memory": driver_memory,
+            "executor_memory": executor_memory,
+            "driver_cores": driver_cores,
+            "executor_cores": executor_cores,
+            "num_executors": num_executors,
+            "total_executor_cores": total_executor_cores,
+            "should_append_params": should_append_params,
+        }
+
+        # Filter out None values
+        body = {k: v for k, v in body.items() if v is not None}
+
+        async with YeeduClient() as client:
+            data = await client.post(f"/api/v1/workspace/{workspace_id}/notebook", json=body)
+            return f"Notebook created successfully: {data}"
+
+    except Exception as e:
+        return f"Error creating notebook: {str(e)}. HINT: Ensure the cluster supports notebooks and notebook_name is unique in the workspace."
+
+
+@mcp.tool(
+    description="Starts a notebook run for a notebook configuration (use notebook_id from create_notebook or the job listing) and starts its kernel. The attached cluster must be RUNNING. Optionally pass runtime_arguments and runtime_conf (Spark conf overrides for this run only). Returns the new run details and kernel status."
+)
+async def start_notebook(
+    workspace_id: int = Field(
+        description="Workspace ID of the workspace where the notebook is present"),
+    notebook_id: int = Field(description="ID of the notebook to start"),
+    start_kernel: bool = Field(
+        default=True, description="Also start the notebook kernel once the run is created"),
+    runtime_arguments: Optional[str] = Field(
+        default=None, description="Runtime arguments for the notebook"),
+    runtime_conf: Optional[List[str]] = Field(
+        default=None, description="Runtime Spark configurations. example: ['spark.executor.memory=2g']"),
+) -> str:
+    """Start a notebook run (and kernel) - cluster must be RUNNING"""
+    try:
+        json_payload = {"notebook_id": notebook_id}
+        if runtime_arguments:
+            json_payload["arguments"] = runtime_arguments
+        if runtime_conf:
+            json_payload["conf"] = runtime_conf
+
+        async with YeeduClient() as client:
+            run = await client.post(
+                f"/api/v1/workspace/{workspace_id}/notebook/run",
+                json=json_payload
+            )
+            result = f"Notebook run started successfully: {run}"
+
+            run_id = run.get("run_id") if isinstance(run, dict) else None
+            if start_kernel and run_id:
+                kernel = await client.post(
+                    f"/api/v1/workspace/{workspace_id}/notebook/run/{run_id}/kernel/startOrGetStatus"
+                )
+                result += f"\nKernel: {kernel}"
+            return result
+
+    except Exception as e:
+        return f"Error starting notebook: {str(e)}. HINT: Check if the attached cluster is active and running."
+
+
+@mcp.tool(
+    description="Starts the kernel of an existing notebook run, or returns its status if already started. The notebook run (run_id from start_notebook) must be in RUNNING state. Returns the kernel status."
+)
+async def start_notebook_kernel(
+    workspace_id: int = Field(
+        description="Workspace ID of the workspace where the notebook run is present"),
+    run_id: int = Field(description="Notebook run ID (not the notebook_id)"),
+) -> str:
+    """Start (or get the status of) the kernel for a RUNNING notebook run"""
+    try:
+        async with YeeduClient() as client:
+            data = await client.post(
+                f"/api/v1/workspace/{workspace_id}/notebook/run/{run_id}/kernel/startOrGetStatus"
+            )
+            return f"Notebook kernel status: {data}"
+
+    except Exception as e:
+        return f"Error starting notebook kernel: {str(e)}. HINT: The notebook run must be RUNNING; check its status with workspace_job_runs."
+
+
+@mcp.tool(
     description="Updates an existing Spark job configuration by job_id. Only provided fields are changed. Editable fields include: name, cluster_id/cluster_name, Spark resources (driver/executor memory, cores), conf/packages/jars, code/command/arguments, Functions-specific params, timeout, concurrency, should_append_params. Always call edit_job_instructions prompt first. Returns the updated job details.",
     annotations={"idempotentHint": True}
 )
