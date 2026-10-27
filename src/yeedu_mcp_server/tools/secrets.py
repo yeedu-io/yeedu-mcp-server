@@ -667,8 +667,10 @@ def _token_table(data) -> Optional[str]:
 
 @mcp.tool(description=(
     "Manages the current user's Yeedu API tokens. "
-    "action=list returns the tokens that exist (CSV: token_id, description, created_date, "
-    "expiry_date) — never a token value, which the platform only returns once at creation. "
+    "action=list returns the tokens that exist (CSV: token_id, description, created_by, "
+    "expiry) — never a token value, which the platform only returns once at creation. "
+    "The platform records no creation date for a token; an expiry of 'infinity' is "
+    "reported as never. "
     "action=create is not performed here, because the new token value would pass through the "
     "model's context: the tool returns the exact CLI command and the UI screen for the user "
     "to run that step themselves. "

@@ -2,7 +2,7 @@
 
 Official [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server for the [Yeedu Data Platform](https://yeedu.io).
 
-The **Yeedu MCP Server** empowers AI agents (such as Claude Desktop, Cursor, and custom MCP clients) to securely inspect, manage, and automate data infrastructure across Yeedu workspace resources—including Spark clusters, job execution, object storage, metastore catalogs, git repositories, and billing usage.
+The **Yeedu MCP Server** empowers AI agents (such as Claude Desktop, Cursor, and custom MCP clients) to securely inspect, manage, and automate data infrastructure across Yeedu workspace resources—including Spark clusters, job and notebook execution, cloud infrastructure, tenants and access control, secrets, object storage, metastore catalogs, git repositories, and billing usage.
 
 ---
 
@@ -18,7 +18,7 @@ graph LR
     subgraph Server["Yeedu MCP Server"]
         FastMCP["FastMCP Core<br/>(stdio / streamable-http)"]
         Auth["YeeduClient<br/>(Header Token Injector)"]
-        Tools["MCP Tools Library<br/>(Cluster, Jobs, Storage, Git, Metastore)"]
+        Tools["MCP Tools Library<br/>(Clusters, Jobs, Notebooks, Infra,<br/>Access, Secrets, Storage, Git, Metastore)"]
     end
 
     subgraph Platform["Yeedu Data Platform"]
@@ -61,6 +61,10 @@ graph LR
 - **Metastore & Catalog Discovery**: Explore Hive, Unity, and Glue metastores; browse schemas, tables, functions, and volumes; extract column schemas and table DDL statements.
 - **Object Storage Management**: Inspect Object Storage Managers (OSM), list bucket contents, download file content, and delete storage objects across cloud providers.
 - **Billing & Cost Analytics**: Generate detailed billing reports (up to 90 days) analyzing total runtime minutes, YCU (Yeedu Compute Unit) consumption, and per-cluster cost breakdowns.
+- **Notebooks**: Create, edit, clone, and run notebooks; start and manage kernels, execute ad-hoc code or selected cells, and read run logs.
+- **Tenant & Access Administration**: Manage tenants and workspaces, browse the user/group directory, assign platform and tenant roles, and grant or revoke workspace access.
+- **Infrastructure Configuration**: Manage cloud environments, credential, network, volume and boot-disk configurations, cluster configurations, and cluster mounts.
+- **Secrets & Tokens**: List tenant, workspace and user secrets, git credentials, and API tokens, and rename, re-describe or delete them — without any secret value crossing the tool interface (see below).
 
 
 ---
@@ -73,6 +77,12 @@ Security is built into the server's design through **Token Isolation**:
 2. **Environment Injection**: The API token (`YEEDU_API_KEY`) is loaded strictly from environment variables at startup and maintained within `YeeduClient`.
 3. **Header Authentication**: Outbound requests automatically attach `Authorization: Bearer <token>` at the transport layer.
 4. **Context Protection**: Credentials are omitted from tool schemas, preventing credentials from appearing in LLM system prompts, tool call arguments, or conversation history logs.
+
+Two further guardrails cover the administrative tools:
+
+5. **Credential Handoff**: No secret value crosses the tool interface in either direction. The operations that would carry one — `manage_secret` create/rotate, `manage_git_credential` create/rotate, `manage_token` create — do not perform the action. They return the exact CLI command and the UI screen for the user to run that one step themselves, and the agent continues by id afterwards. Everything that does not carry a value (listing, renaming, re-describing, deleting, referencing by id) stays in the server.
+
+6. **Confirmation Gate**: Every destructive operation takes a `confirm` parameter and refuses to act without it. Called without it the tool performs nothing: it reads the record back and returns what would be lost, plus the exact line to retry. The agent is instructed never to set `confirm` on a first call and never to self-confirm — the flag means a human has seen that specific record and said yes.
 
 ---
 
@@ -113,6 +123,8 @@ Environment variables configure the server via `pydantic-settings`:
 |---|---|---|---|
 | `YEEDU_API_KEY` | ✅ | — | Yeedu Personal Access Token (PAT) |
 | `YEEDU_API_BASE_URL` | ✅ | — | Base URL of your Yeedu instance (e.g. `https://yeedu.example.com:8080`) |
+| `YEEDU_UI_BASE_URL` | optional | — | Base URL of the web UI, when it differs from the API host. Set it so the credential-handoff tools print a clickable link to the screen the user needs; unset, they name the screen without revealing a host. |
+| `YEEDU_API_TIMEOUT` | optional | `60.0` | Request timeout in seconds |
 | `YEEDU_MCP_TRANSPORT` | optional | `stdio` | Transport mode: `stdio` or `streamable-http` |
 | `YEEDU_MCP_SERVER_URL` | optional | `http://127.0.0.1:8000/mcp` | Server URL when running in `streamable-http` mode |
 | `VERIFY_SSL` | optional | `false` | Enable strict TLS certificate verification |
@@ -121,6 +133,10 @@ Environment variables configure the server via `pydantic-settings`:
 | `LOG_DIR` | optional | `~/.yeedu-mcp/logs` | Directory for the rotating log file (`yeedu-mcp-server.log`) |
 | `LOG_MAX_BYTES` | optional | `5242880` (5 MB) | Size at which the log file rotates |
 | `LOG_BACKUP_COUNT` | optional | `3` | Rotated files kept; total disk use is capped at about 20 MB |
+| `YEEDU_POOL_SIZE` | optional | `10` | Connection pool size |
+| `YEEDU_POOL_MAX_CONNECTIONS` | optional | `100` | Maximum pooled connections |
+| `YEEDU_POOL_MAX_KEEPALIVE` | optional | `50` | Maximum idle keep-alive connections |
+| `YEEDU_POOL_MAX_CONCURRENT` | optional | `500` | Maximum concurrent in-flight requests |
 
 > **Configuration Precedence**: Environment variables set in the host environment or passed via client configuration (`mcpServers.env`) override local `.env` files.
 
@@ -290,98 +306,150 @@ The server listens on `http://127.0.0.1:8000/mcp` (see `YEEDU_MCP_SERVER_URL`). 
 
 ## Available Tools
 
-The Yeedu MCP server exposes 40+ production tools categorized by platform domain:
+The server exposes **96 tools**. Read operations are plain tools; write operations are grouped into `manage_*` tools that take an `action` parameter, so one tool covers the create / list / get / edit / delete surface of a resource.
 
-### 1. Identity & Access
+Two conventions apply throughout:
+
+- Any `action` that destroys or disables something takes `confirm=True`. Without it the tool performs nothing and returns the record it would have changed.
+- No tool accepts or returns a secret value. The operations that would carry one return the CLI command and UI screen for the user to run that step themselves.
+
+### 1. Identity, Directory & Access
 | Tool | Description |
 |---|---|
-| `get_user_info` | Retrieves current authenticated user profile, tenant memberships, and assigned roles. |
-| `list_tenants` | Lists available tenants accessible to the authenticated user. |
-| `get_user_roles` | Gets roles assigned to a user within a specific tenant context. |
-| `get_roles` | Lists all platform system roles and descriptions. |
-| `get_workspace_permissions` | Checks user access levels for a given workspace. |
-| `list_workspace_permissions` | Lists all available permission levels across workspaces. |
+| `get_user_info` | Current authenticated user's profile, tenant memberships, and assigned roles. |
+| `get_user_roles` | Roles assigned to a user, optionally scoped to one tenant. |
+| `get_roles` | Platform system roles and their descriptions. |
+| `browse_directory` | Reads the tenant's user and group directory: `list`, `search`, `get`, `match`. |
+| `manage_role_assignment` | Tenant role assignment for a user or group: `list`, `get`, `by_role`, `assign`, `remove`. Inherited roles are reported with the group they come from. |
+| `manage_workspace_access` | Who can use a workspace: `list`, `search`, `grant`, `edit`, `revoke`, `members`, `memberships`. |
+| `get_workspace_permissions` | The calling user's access level on a given workspace. |
+| `list_workspace_permissions` | The permission levels a workspace grant can use. |
 
-### 2. Cluster Management
+### 2. Tenants & Workspaces
 | Tool | Description |
 |---|---|
-| `list_clusters` | Searches cluster instances filtered by name, status, config, or state. |
-| `get_cluster_details` | Retrieves full configuration specifications (vCPU, memory, cloud env, Spark version). |
-| `create_cluster` | Creates a new compute cluster (YEEDU, STANDALONE, or CLUSTER type). |
-| `update_cluster` | Updates cluster settings such as name, idle timeout, worker counts, or labels. |
-| `cluster_action` | Controls lifecycle actions: `start`, `stop`, `destroy`, `disable`, `enable`, `stop_all_jobs`. |
-| `get_cluster_events` | Gets status-change lifecycle history for a cluster. |
-| `get_cluster_node_events` | Retrieves node-level utilization and IP addressing metrics. |
-| `get_cluster_logs` | Fetches STDOUT or STDERR logs for specific cluster node status events. |
-| `get_cluster_errors` | Retrieves system error details for cluster startup or operational failures. |
-| `get_cluster_prerequisites` | Fetches available cloud environments, machine types, and Spark infra versions. |
-| `get_cluster_stats` | Displays job status execution breakdown for a cluster. |
-| `get_cluster_workspaces` | Lists workspaces attached to a cluster instance. |
-| `analyze_cluster_issue` | Generates diagnostic investigation guides for cluster failures. |
+| `list_tenants` | Tenants accessible to the authenticated user. |
+| `manage_tenant` | Tenant administration (Platform Admin): `list`, `search`, `get`, `user`, `create`, `edit`, `delete`. |
+| `list_workspaces` | Workspaces with job and notebook counts. |
+| `manage_workspace` | `create`, `edit` (rename / re-describe), `enable`, `disable`. Workspaces are disabled rather than deleted. |
+| `get_workspace_stats` | Aggregated job-run status counts for a workspace. |
+| `get_workspace_clusters` | Cluster instances attached to a workspace. |
+| `export_workspace` | Exports job and notebook definitions to a `.yeedu` file, or a `.zip` when notebooks are present. |
+| `import_workspace` | Imports jobs and notebooks from an export file into a workspace. |
 
-### 3. Spark Jobs & Executions
+### 3. Cluster Management
 | Tool | Description |
 |---|---|
-| `list_job_configurations` | Lists job definitions filtered by type, language, status, or workspace. |
-| `get_job_configuration` | Retrieves detailed job definition metadata and code/command settings. |
-| `create_job` | Creates new Spark job configurations (Custom Code, Thrift SQL, Functions, JAR). |
-| `edit_job` | Modifies existing job configurations and Spark resource allocations. |
-| `run_job` | Submits a job configuration for execution with optional runtime arguments. |
-| `stop_job_run` | Cancels an active or submitted job run. |
-| `workspace_job_runs` | Views execution run history across a workspace. |
-| `get_job_run_details` | Gets run-level execution status, runtime config, and status transition history. |
-| `get_job_run_logs` | Retrieves STDOUT or STDERR log output for job runs. |
-| `get_job_errors` | Gets workflow engine system errors for failed job runs. |
-| `analyze_job_issue` | Generates diagnostic investigation checklists for failed or degraded jobs. |
+| `list_clusters` | Searches cluster instances by name, status, config, or enabled state. |
+| `get_cluster_details` | Full configuration: machine specs, cloud environment, network, Spark version, autoscaling, audit fields. |
+| `create_cluster` | Creates a cluster instance from a cluster configuration and cloud environment. |
+| `update_cluster` | Changes name, idle timeout, worker counts, or labels. |
+| `cluster_action` | Lifecycle: `start`, `stop`, `destroy`, `disable`, `enable`, `stop_all_jobs`. |
+| `get_cluster_events` | Status-change history, with the status IDs the log and error tools need. |
+| `get_cluster_node_events` | Node-level utilization and addressing events. |
+| `get_cluster_logs` | STDOUT or STDERR for a cluster node status event. |
+| `get_cluster_errors` | System error detail for startup or operational failures. |
+| `get_cluster_stats` | Job execution counts for a cluster, by status. |
+| `get_cluster_workspaces` | Workspaces attached to a cluster instance. |
+| `get_cluster_prerequisites` | Cloud environments, machine types, and Spark infra versions available for a new cluster. |
+| `analyze_cluster_issue` | Diagnostic investigation guide for a cluster failure. |
 
-### 4. Workspace & Files
+### 4. Infrastructure Configuration
+These build the stack a cluster needs, bottom up: a credential configuration, then a network configuration and boot disk image, then a cloud environment, then a cluster configuration.
+
 | Tool | Description |
 |---|---|
-| `list_workspaces` | Lists workspace environments with job/notebook aggregate counts. |
-| `browse_workspace_files` | Navigates directory file trees inside a workspace. |
-| `get_workspace_file` | Downloads raw text contents of workspace files. |
-| `upload_workspace_file` | Uploads new files or creates directories in a workspace. |
-| `manage_workspace_file` | Manages file operations: `delete`, `rename`, `move`, `copy`. |
-| `get_workspace_stats` | Gets aggregated job execution statistics for a workspace. |
-| `get_workspace_clusters` | Lists cluster instances attached to a workspace. |
-| `export_workspace` | Exports job and notebook configurations to `.yeedu` or `.zip` archives. |
+| `list_compute_lookups` | Platform-seeded reference data the create calls need: `cloud_providers`, `availability_zones`, `machine_types`, `disk_machine_types`, `credential_types`, `linux_distros`, `spark_infra_versions`, `spark_compute_types`. |
+| `manage_credential_config` | Cloud credential configurations, the base every other resource references by id. |
+| `manage_network_config` | Network configurations. A subnet and availability zone are fields here; there is no separate subnet resource. |
+| `manage_boot_disk_image` | Boot disk image configurations — the OS image nodes boot from. |
+| `manage_volume_config` | Standalone volume configurations (disk layout templates). |
+| `manage_cloud_env` | Cloud environments, binding a credential config, network config and boot disk image. Also `list_onprem_nodes`. |
+| `manage_cluster_config` | Cluster configurations — machine shape and disk layout. |
+| `manage_cluster_mount` | Object storage (S3, ADLS, GCS, S3a) mounted into a cluster's filesystem, referencing a credential configuration by id. |
+| `manage_cluster_workspace_access` | `associate` / `dissociate` a cluster with a workspace, which is what makes it selectable there. |
 
-### 5. Git Operations
+### 5. Spark Jobs & Executions
 | Tool | Description |
 |---|---|
-| `git_clone_repo` | Clones a remote HTTPS Git repository into a workspace folder. |
-| `git_branches` | Lists, creates, or switches Git branches in workspace repositories. |
-| `git_status` | Inspects workspace repository status (staged, untracked, modified). |
-| `git_stage_files` | Stages modified files for upcoming commits. |
-| `git_file_diff` | Views diff details for modified repository files. |
-| `git_commit_push` | Commits staged changes and pushes to remote Git branches. |
-| `git_sync` | Synchronizes repositories via remote `pull` or local change `discard`. |
-| `list_git_credentials` | Lists user Git credentials configured for platform repositories. |
+| `list_job_configurations` | Job definitions filtered by type, language, status, or workspace. |
+| `get_job_configuration` | Job definition metadata and code/command settings. |
+| `create_job` | Creates a job definition (Custom Code, Thrift SQL, Functions, JAR). |
+| `edit_job` | Changes a job definition and its Spark resource allocation. |
+| `run_job` | Submits a job definition for execution, with optional runtime arguments. |
+| `stop_job_run` | Cancels an active or submitted run. |
+| `workspace_job_runs` | Run history across a workspace. |
+| `get_job_run_details` | Run status, runtime configuration, and status transitions. |
+| `get_job_run_logs` | STDOUT or STDERR for a run. |
+| `get_job_errors` | Workflow engine errors for a failed run. |
+| `analyze_job_issue` | Diagnostic checklist for a failed or degraded job. |
 
-### 6. Metastore & Catalogs
+### 6. Notebooks
 | Tool | Description |
 |---|---|
-| `list_metastore_catalogs` | Lists configured metastores (Hive, Unity, Glue). |
+| `list_notebooks` | Notebook definitions in a workspace. |
+| `get_notebook` | Notebook definition and cell contents. |
+| `create_notebook` | Creates a notebook definition against a cluster. |
+| `edit_notebook` | Changes a notebook definition. |
+| `clone_notebook` | Copies a notebook definition. |
+| `set_notebook_state` | Enables or disables a notebook. |
+| `start_notebook` | Starts a notebook run. |
+| `start_notebook_kernel` | Starts the kernel for a run. |
+| `notebook_kernel_action` | Kernel lifecycle: interrupt, restart, shut down. |
+| `get_notebook_kernel_status` | Current kernel state. |
+| `execute_notebook_code` | Runs ad-hoc code in a live kernel and returns the output. |
+| `run_notebook_cells` | Runs the notebook's own cells and optionally saves the outputs back. |
+| `list_notebook_runs` | Run history for notebooks. |
+| `get_notebook_run` | Status and configuration of one notebook run. |
+| `get_notebook_run_logs` | STDOUT or STDERR for a notebook run. |
+| `stop_notebook_run` | Stops an active notebook run. |
+
+### 7. Workspace Files & Git
+| Tool | Description |
+|---|---|
+| `browse_workspace_files` | Navigates a workspace's directory tree. |
+| `get_workspace_file` | Reads a workspace file's text contents. |
+| `upload_workspace_file` | Uploads a file or creates a directory. |
+| `manage_workspace_file` | `delete`, `rename`, `move`, `copy`. |
+| `git_clone_repo` | Clones an HTTPS repository into a workspace folder. |
+| `git_branches` | Lists, creates, or switches branches. |
+| `git_status` | Staged, modified, and untracked files. |
+| `git_stage_files` | Stages modified files. |
+| `git_file_diff` | Diff for a modified file. |
+| `git_commit_push` | Commits staged changes and pushes. |
+| `git_sync` | `pull` from remote or `discard` local changes. |
+
+### 8. Metastore & Catalogs
+| Tool | Description |
+|---|---|
+| `list_metastore_catalogs` | Configured metastores (Hive, Unity, Glue). |
+| `manage_metastore_catalog` | `create`, `edit`, `delete` a metastore catalog configuration; the fields that apply depend on `catalog_type`. |
+| `manage_catalog_secret_link` | Links a catalog to the secrets used to reach it, at `user`, `workspace` or `tenant` scope. |
 | `browse_catalog` | Browses catalogs, schemas, tables, functions, or volumes. |
-| `get_table_details` | Retrieves table column schemas or raw SQL `CREATE TABLE` DDL. |
+| `get_table_details` | Column schema or raw `CREATE TABLE` DDL. |
 
-### 7. Object Storage & Secrets
+### 9. Object Storage, Secrets & Billing
 | Tool | Description |
 |---|---|
-| `list_storage_managers` | Lists configured Object Storage Managers across AWS, GCP, Azure, or OnPrem. |
-| `manage_osm_files` | Lists, downloads, or deletes files in object storage buckets. |
-| `get_billing_report` | Generates billing usage reports with per-cluster YCU and cost breakdowns. |
-| `list_user_secrets` | Lists personal user secrets. |
-| `list_workspace_secrets` | Lists workspace-scoped secrets and environment variables. |
+| `list_storage_managers` | Object Storage Managers across AWS, GCP, Azure, and OnPrem. |
+| `manage_osm_files` | `list`, `download`, `delete` files in object storage. |
+| `list_tenant_secrets` | Secrets at tenant scope, usable by every workspace in the tenant. |
+| `list_workspace_secrets` | Secrets and environment variables scoped to a workspace. |
+| `list_user_secrets` | The calling user's personal secrets. |
+| `manage_secret` | Renames, re-describes or deletes a secret. `create` and `rotate` carry a value, so they hand off to the CLI or UI. |
+| `list_git_credentials` | The user's Git credentials, never their tokens. |
+| `manage_git_credential` | `get`, `edit` (username), `delete`. `create` and `rotate` carry the token, so they hand off. |
+| `manage_token` | `list` and `delete` API tokens. `create` hands off, because the new token value would otherwise pass through the model's context. |
+| `get_billing_report` | Usage report for a date range (max 90 days): minutes, YCU consumption, and a per-cluster breakdown. |
 
-### 8. Platform Metadata Reference
+### 10. Platform Metadata Reference
 | Tool | Description |
 |---|---|
-| `get_job_types` | Displays supported internal job type codes. |
-| `get_job_languages` | Displays supported programming languages per job type. |
-| `get_job_statuses` | Lists all valid job execution status codes. |
-| `get_cluster_statuses` | Lists all valid cluster lifecycle status codes. |
-| `get_cluster_node_statuses` | Lists all valid node event status codes. |
+| `get_job_types` | Supported job type codes. |
+| `get_job_languages` | Supported languages per job type. |
+| `get_job_statuses` | Valid job execution status codes. |
+| `get_cluster_statuses` | Valid cluster lifecycle status codes. |
+| `get_cluster_node_statuses` | Valid node event status codes. |
 
 ---
 
