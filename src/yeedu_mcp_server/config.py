@@ -27,6 +27,13 @@ class ServerSettings(BaseSettings):
         default=60.0,
         description="Yeedu API request timeout in seconds",
     )
+    yeedu_ui_base_url: Optional[str] = Field(
+        default=None,
+        description="Yeedu web UI base URL. Optional, and separate from the API URL. "
+                    "Set it only to have tools print a clickable link when handing a "
+                    "credential or secret operation back to the user. When unset, "
+                    "tools name the UI screen without revealing any host.",
+    )
 
     # --- Yeedu Connection Pool ---
     yeedu_pool_size: int = Field(
@@ -112,6 +119,7 @@ SSL_VERIFY_YEEDU = resolve_ssl_verify()
 YEEDU_API_BASE_URL = settings.yeedu_api_base_url
 YEEDU_API_KEY = settings.yeedu_api_key
 YEEDU_API_TIMEOUT = settings.yeedu_api_timeout
+YEEDU_UI_BASE_URL = settings.yeedu_ui_base_url
 YEEDU_POOL_SIZE = settings.yeedu_pool_size
 YEEDU_POOL_MAX_CONNECTIONS = settings.yeedu_pool_max_connections
 YEEDU_POOL_MAX_KEEPALIVE = settings.yeedu_pool_max_keepalive

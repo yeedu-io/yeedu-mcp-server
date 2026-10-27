@@ -7,6 +7,7 @@ Provides capabilities to list object storage manager configurations and manage f
 from typing import Optional
 from pydantic import Field
 from yeedu_mcp_server.client import YeeduClient
+from yeedu_mcp_server.utils.confirm import confirmation_required, confirmed
 from yeedu_mcp_server.mcp_server import mcp
 
 
@@ -70,9 +71,13 @@ async def list_storage_managers(
         return f"Error listing storage managers: {str(e)}. HINT: Ensure your API connection is valid and cloud_provider filter value is correct."
 
 
-@mcp.tool(description="Manages files in an object storage manager. action=list returns CSV: file_id, file_name, file_path, file_size, is_directory with pagination. action=download returns the raw file content (up to 5000 chars). action=delete removes a file and returns CSV: action, file_id, status. Requires osm_id or osm_name; file_id or file_path is required for download/delete.")
+@mcp.tool(description="Manages files in an object storage manager. action=list returns CSV: file_id, file_name, file_path, file_size, is_directory with pagination. action=download returns the raw file content (up to 5000 chars). action=delete removes a file and returns CSV: action, file_id, status. Requires osm_id or osm_name; file_id or file_path is required for download/delete. action='delete' requires confirm=True: the first call returns the file it would delete and does nothing, so ask the user before repeating the call with confirm=True.")
 async def manage_osm_files(
     action: str = Field(description="Action: list, download, or delete"),
+    confirm: bool = Field(
+        default=False,
+        description="Must be True for action='delete'. Set it only after the user has confirmed this specific file.",
+    ),
     osm_id: Optional[int] = Field(
         default=None, description="Object storage manager ID"),
     osm_name: Optional[str] = Field(
@@ -99,6 +104,27 @@ async def manage_osm_files(
 
         if action in ("download", "delete") and file_id is None and file_path is None:
             return f"Error: file_id or file_path is required for {action} action. HINT: Call manage_osm_files with action='list' first to view files."
+
+        # Refuse before opening a connection, so an unreachable API cannot turn
+        # a refusal into an error the agent retries its way past.
+        if action == "delete" and not confirmed(confirm):
+            target = (
+                f"file_id={file_id}" if file_id is not None else f"'{file_path}'"
+            )
+            osm = f"osm_id={osm_id}" if osm_id is not None else f"osm_name='{osm_name}'"
+            retry = (
+                f"{osm}, "
+                + (f"file_id={file_id}" if file_id is not None
+                   else f"file_path='{file_path}'")
+            )
+            return confirmation_required(
+                "Object storage file",
+                target,
+                "manage_osm_files",
+                record=f"Storage manager: {osm}",
+                impact="The object is deleted from the storage bucket and cannot be recovered through Yeedu.",
+                retry=retry,
+            )
 
         async with YeeduClient() as client:
             # Common params

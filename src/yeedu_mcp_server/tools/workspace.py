@@ -3,6 +3,7 @@ import json
 from typing import Any, List, Optional
 from pydantic import Field
 from yeedu_mcp_server.client import YeeduClient
+from yeedu_mcp_server.utils.confirm import confirmation_required, confirmed
 from yeedu_mcp_server.utils.formatting import serialize_table
 from yeedu_mcp_server.mcp_server import mcp
 
@@ -416,10 +417,14 @@ async def upload_workspace_file(
         return f"Error uploading file to workspace: {str(e)}. HINT: Make sure the file path starts with '/' and is not within a write-protected directory."
 
 
-@mcp.tool(description="Performs a file management operation on a workspace file: delete, rename (requires new_name), move, or copy (requires destination_path). Identify the file by file_id or file_path. Returns CSV: action, workspace_id, file_id/file_path, result_file_id/result_path, status.")
+@mcp.tool(description="Performs a file management operation on a workspace file: delete, rename (requires new_name), move, or copy (requires destination_path). Identify the file by file_id or file_path. Returns CSV: action, workspace_id, file_id/file_path, result_file_id/result_path, status. action='delete' requires confirm=True: the first call returns the file it would delete and does nothing, so ask the user before repeating the call with confirm=True.")
 async def manage_workspace_file(
     workspace_id: int = Field(description="Workspace ID"),
     action: str = Field(description="Action: delete, rename, move, or copy"),
+    confirm: bool = Field(
+        default=False,
+        description="Must be True for action='delete'. Set it only after the user has confirmed this specific file.",
+    ),
     file_id: Optional[int] = Field(
         default=None, description="File ID to act on"),
     file_path: Optional[str] = Field(
@@ -443,6 +448,26 @@ async def manage_workspace_file(
             return "Error: new_name is required for rename action."
         if action in ("move", "copy") and not destination_path:
             return f"Error: destination_path is required for {action} action."
+
+        # Refuse before opening a connection, so an unreachable API cannot turn
+        # a refusal into an error the agent retries its way past.
+        if action == "delete" and not confirmed(confirm):
+            target = (
+                f"file_id={file_id}" if file_id is not None else f"'{file_path}'"
+            )
+            retry = (
+                f"workspace_id={workspace_id}, "
+                + (f"file_id={file_id}" if file_id is not None
+                   else f"file_path='{file_path}'")
+            )
+            return confirmation_required(
+                "Workspace file",
+                target,
+                "manage_workspace_file",
+                record=f"Workspace: {workspace_id}",
+                impact="The file is removed from the workspace; notebooks and jobs that reference it will fail to load.",
+                retry=retry,
+            )
 
         async with YeeduClient() as client:
             # Clean file_path and destination_path if provided
@@ -617,4 +642,274 @@ async def export_workspace(
 
     except Exception as e:
         return f"Error exporting workspace: {str(e)}. HINT: Ensure you have read/export permissions for workspace_id/workspace_name."
+
+
+# ---------------------------------------------------------------------------
+# Workspace lifecycle
+#
+# Yeedu has no DELETE for a workspace — disable is the only removal path, and
+# it is reversible with enable. It is still gated behind confirm, because a
+# disabled workspace takes its jobs and notebooks out of reach.
+# ---------------------------------------------------------------------------
+
+_WORKSPACE_ACTIONS = ("create", "edit", "enable", "disable")
+
+#: Pages of /workspaces to scan when looking a workspace up by id alone.
+_LOOKUP_PAGE_LIMIT = 100
+_LOOKUP_MAX_PAGES = 3
+
+
+async def _describe_workspace(
+    workspace_id: Optional[int], workspace_name: Optional[str]
+) -> Optional[str]:
+    """Read a workspace back, for the line shown before it is disabled.
+
+    There is no GET on /workspace, and /workspace/stats returns job-run status
+    counts rather than a workspace, so the record comes from the listing: by
+    name through /workspaces/search, or by scanning /workspaces when only an id
+    is known. Best effort — the confirmation still names the target without it.
+    """
+    try:
+        async with YeeduClient() as client:
+            if workspace_name:
+                data = await client.get(
+                    "/api/v1/workspaces/search",
+                    params={"workspace_name": workspace_name,
+                            "pageNumber": 1, "limit": _LOOKUP_PAGE_LIMIT},
+                )
+                rows = _candidate_rows(data)
+                match = next(
+                    (r for r in rows if r.get("name") == workspace_name), None)
+            else:
+                match = None
+                for page in range(1, _LOOKUP_MAX_PAGES + 1):
+                    data = await client.get(
+                        "/api/v1/workspaces",
+                        params={"pageNumber": page, "limit": _LOOKUP_PAGE_LIMIT},
+                    )
+                    rows = _candidate_rows(data)
+                    match = next(
+                        (r for r in rows
+                         if r.get("workspace_id") == workspace_id), None)
+                    if match or len(rows) < _LOOKUP_PAGE_LIMIT:
+                        break
+    except Exception:
+        return None
+
+    if not isinstance(match, dict):
+        return None
+    return (
+        f"Workspace: {match.get('name', 'N/A')} "
+        f"(id {match.get('workspace_id', 'N/A')}) — "
+        f"{match.get('job_count', '?')} jobs, "
+        f"{match.get('notebook_count', '?')} notebooks"
+    )
+
+
+def _candidate_rows(data) -> list:
+    """The workspace records in a listing response, whatever it is wrapped in."""
+    if isinstance(data, list):
+        return [r for r in data if isinstance(r, dict)]
+    if isinstance(data, dict):
+        rows = data.get("data")
+        if isinstance(rows, list):
+            return [r for r in rows if isinstance(r, dict)]
+    return []
+
+
+@mcp.tool(description="Creates, renames or enables/disables a workspace. action=create requires name (description optional). action=edit/enable/disable identify the workspace by workspace_id or workspace_name; edit changes name and/or description. There is no delete for workspaces — disable is the removal path and is reversible with enable, and it requires confirm=True: the first call returns the workspace it would disable and does nothing. Returns the resulting workspace record.")
+async def manage_workspace(
+    action: str = Field(
+        description="Action: create, edit, enable, or disable"),
+    workspace_id: Optional[int] = Field(
+        default=None, description="Workspace ID (for edit, enable, disable)"),
+    workspace_name: Optional[str] = Field(
+        default=None, description="Workspace name, if workspace_id is not given (for edit, enable, disable)"),
+    name: Optional[str] = Field(
+        default=None, description="Workspace name to set (required for create, optional for edit)"),
+    description: Optional[str] = Field(
+        default=None, description="Workspace description (optional for create and edit)"),
+    confirm: bool = Field(
+        default=False,
+        description="Must be True for action='disable'. Set it only after the user has confirmed this specific workspace.",
+    ),
+) -> str:
+    """Create, edit, enable or disable a workspace."""
+    try:
+        if action not in _WORKSPACE_ACTIONS:
+            return (
+                f"Error: Invalid action '{action}'. "
+                f"HINT: Must be one of: {', '.join(_WORKSPACE_ACTIONS)}."
+            )
+
+        if action == "create":
+            if not name:
+                return "Error: name is required for action='create'."
+            body = {"name": name}
+            if description:
+                body["description"] = description
+            async with YeeduClient() as client:
+                data = await client.post("/api/v1/workspace", json=body)
+            return _workspace_result("created", data)
+
+        if workspace_id is None and not workspace_name:
+            return (
+                f"Error: Either workspace_id or workspace_name is required for action='{action}'. "
+                "HINT: Call list_workspaces to find it."
+            )
+
+        params = {}
+        if workspace_id is not None:
+            params["workspace_id"] = workspace_id
+        else:
+            params["workspace_name"] = workspace_name
+
+        target = (
+            f"workspace_id={workspace_id}" if workspace_id is not None
+            else f"'{workspace_name}'"
+        )
+
+        if action == "edit":
+            if not name and description is None:
+                return "Error: Provide name and/or description to change for action='edit'."
+            body = {}
+            if name:
+                body["name"] = name
+            if description is not None:
+                body["description"] = description
+            async with YeeduClient() as client:
+                data = await client.put(
+                    "/api/v1/workspace", params=params, json=body)
+            return _workspace_result("updated", data)
+
+        if action == "disable":
+            # Refuse before opening a connection, so an unreachable API cannot
+            # turn a refusal into an error the agent retries its way past.
+            if not confirmed(confirm):
+                record = await _describe_workspace(workspace_id, workspace_name)
+                retry = (
+                    f"workspace_id={workspace_id}" if workspace_id is not None
+                    else f"workspace_name='{workspace_name}'"
+                )
+                return confirmation_required(
+                    "Workspace",
+                    target,
+                    "manage_workspace",
+                    action="disable",
+                    record=record,
+                    impact="The workspace and every job and notebook in it become inaccessible. Nothing is deleted — manage_workspace(action='enable') restores it.",
+                    retry=retry,
+                )
+
+        endpoint = f"/api/v1/workspace/{action}"
+        async with YeeduClient() as client:
+            data = await client.put(endpoint, params=params)
+        return _workspace_result(f"{action}d", data)
+
+    except Exception as e:
+        return (
+            f"Error running action '{action}' on workspace: {str(e)}. "
+            "HINT: Call list_workspaces to confirm the workspace exists and that the name is not already taken."
+        )
+
+
+def _workspace_result(verb: str, data: Any) -> str:
+    """Render the workspace record an action returned."""
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    if not isinstance(data, dict):
+        return f"Workspace {verb} successfully."
+    rows = [
+        ["Workspace ID", data.get("workspace_id", "N/A")],
+        ["Name", data.get("name", "N/A")],
+        ["Description", data.get("description") or "N/A"],
+        ["Enabled", data.get("enable", "N/A")],
+    ]
+    return (
+        f"Workspace {verb} successfully.\n\n"
+        + serialize_table(rows, headers=["Field", "Value"])
+    )
+
+
+@mcp.tool(description="Imports jobs and notebooks from a workspace export file (.yeedu or .zip produced by export_workspace) into a workspace. The file is read from the filesystem where the MCP server runs. Identify the destination by workspace_id or workspace_name; workspace_name creates the workspace if it does not exist. cluster_id or cluster_name attaches the imported jobs to a cluster. overwrite replaces an existing workspace's contents; permissive completes a partial import instead of failing on the first error. Returns what was imported.")
+async def import_workspace(
+    file_path: str = Field(
+        description="Local path to the export file, e.g. /home/user/exports/my_workspace.yeedu"),
+    workspace_id: Optional[int] = Field(
+        default=None, description="Destination workspace ID"),
+    workspace_name: Optional[str] = Field(
+        default=None, description="Destination workspace name, if workspace_id is not given"),
+    cluster_id: Optional[int] = Field(
+        default=None, description="Cluster instance ID to attach the imported jobs to"),
+    cluster_name: Optional[str] = Field(
+        default=None, description="Cluster instance name, if cluster_id is not given"),
+    overwrite: bool = Field(
+        default=False, description="Replace the contents of an existing workspace"),
+    permissive: bool = Field(
+        default=False, description="Import what can be imported instead of failing on the first error"),
+) -> str:
+    """Import a workspace export file into a workspace."""
+    try:
+        if workspace_id is None and not workspace_name:
+            return "Error: Either workspace_id or workspace_name is required."
+
+        import os
+        import zipfile
+
+        if not os.path.isfile(file_path):
+            return (
+                f"Error: No file at {file_path}. "
+                "HINT: The path is read on the machine running this MCP server. "
+                "Produce one with export_workspace first."
+            )
+
+        # A workspace export is either a bare .yeedu JSON document or a zip
+        # holding that document alongside the .ipynb files.
+        if zipfile.is_zipfile(file_path):
+            with zipfile.ZipFile(file_path) as archive:
+                members = [n for n in archive.namelist()
+                           if n.endswith(".yeedu")]
+                if not members:
+                    return (
+                        f"Error: {file_path} is a zip with no .yeedu document inside. "
+                        "HINT: Import the file produced by export_workspace, unmodified."
+                    )
+                raw = archive.read(members[0]).decode("utf-8")
+        else:
+            with open(file_path, "r", encoding="utf-8") as f:
+                raw = f.read()
+
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as e:
+            return (
+                f"Error: {file_path} is not a valid workspace export ({e}). "
+                "HINT: Import the file produced by export_workspace, unmodified."
+            )
+
+        params: dict = {
+            "overwrite": str(bool(overwrite)).lower(),
+            "permissive": str(bool(permissive)).lower(),
+        }
+        if workspace_id is not None:
+            params["workspace_id"] = workspace_id
+        else:
+            params["workspace_name"] = workspace_name
+        if cluster_id is not None:
+            params["cluster_id"] = cluster_id
+        elif cluster_name:
+            params["cluster_name"] = cluster_name
+
+        async with YeeduClient() as client:
+            data = await client.post(
+                "/api/v1/workspace/import", params=params, json=payload)
+
+        return "Workspace imported successfully.\n\n" + json.dumps(data, indent=2, default=str)
+
+    except Exception as e:
+        return (
+            f"Error importing workspace: {str(e)}. "
+            "HINT: If the destination workspace already has these jobs, retry with overwrite=True; "
+            "to keep going past individual failures, retry with permissive=True."
+        )
 
