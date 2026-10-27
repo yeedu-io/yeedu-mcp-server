@@ -9,7 +9,7 @@ description = "Yeedu MCP Server — exposes the Yeedu data platform to AI agents
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "mcp[cli]>=1.9.2",
+    "mcp[cli]>=1.9.2,<2",
     "httpx==0.28.1",
     "pydantic>=2",
     "pydantic-settings>=2",
