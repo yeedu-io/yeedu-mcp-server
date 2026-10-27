@@ -716,7 +716,11 @@ async def create_job(
     principal: Optional[str] = Field(
         default=None, description="Kerberos principal"),
     keytab: Optional[str] = Field(
-        default=None, description="Kerberos keytab file"),
+        default=None,
+        description="Path to the Kerberos keytab file on the cluster, passed "
+                    "through as spark-submit --keytab. This is a path, not the "
+                    "keytab contents; keytab material belongs in a HIVE KERBEROS "
+                    "secret, which this server never carries."),
     queue: Optional[str] = Field(
         default=None, description="YARN queue to submit the job to"),
 
@@ -1010,7 +1014,11 @@ async def edit_job(
     principal: Optional[str] = Field(
         default=None, description="Kerberos principal"),
     keytab: Optional[str] = Field(
-        default=None, description="Kerberos keytab file"),
+        default=None,
+        description="Path to the Kerberos keytab file on the cluster, passed "
+                    "through as spark-submit --keytab. This is a path, not the "
+                    "keytab contents; keytab material belongs in a HIVE KERBEROS "
+                    "secret, which this server never carries."),
     queue: Optional[str] = Field(
         default=None, description="YARN queue to submit the job to"),
 

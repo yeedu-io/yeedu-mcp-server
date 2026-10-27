@@ -19,10 +19,9 @@ uvx yeedu-mcp-server --transport streamable-http       # HTTP mode instead of th
 
 ### Verifying a change
 
-There is no test suite — no `pytest`, no `tests/` directory. Verification is a syntax check plus a registration check:
-
 ```bash
-uv run python -m py_compile src/yeedu_mcp_server/tools/<file>.py
+uv run --group dev pytest                               # the suite; needs no API key and reaches nothing
+uv run python -m compileall -q src/yeedu_mcp_server/    # syntax only
 
 uv run python -c "
 import yeedu_mcp_server.main, asyncio
@@ -30,7 +29,11 @@ from yeedu_mcp_server.mcp_server import mcp
 print(len(asyncio.run(mcp.list_tools())), 'tools')"
 ```
 
-The registration check is the important one: it catches a missing import in `main.py`, a malformed `@mcp.tool` decorator, or a signature FastMCP cannot build a schema from — none of which `py_compile` sees.
+The registration check is the one `compileall` cannot replace: it catches a missing import in `main.py`, a malformed `@mcp.tool` decorator, or a signature FastMCP cannot build a schema from. `tests/test_registry.py` runs it as an assertion, along with the structural invariants — every destructive tool exposes a `confirm` parameter defaulting to false, no tool accepts a parameter that would be a secret value, `SYSTEM_PROMPT` still carries both policy sections.
+
+`tests/test_record_shapes.py` is the regression net for the class of defect described under *Response shapes* below. Each case is a shape captured from the live platform; the assertion is that no cell is `N/A` where the response had data. **When you correct a field mapping, add the fixture here** — that is the only way the fix survives, since the wrong mapping does not fail, it renders `N/A`.
+
+What the suite cannot cover: anything that needs the platform. URL shapes, HTTP status behaviour and request field names are still only verified by a live call through a connected client.
 
 ### Iterating against a live MCP client
 

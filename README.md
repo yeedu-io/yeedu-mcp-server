@@ -466,9 +466,18 @@ cp .env.example .env
 # Launch MCP Inspector (Interactive Web GUI for testing tools)
 uv run mcp dev src/yeedu_mcp_server/main.py
 
-# Execute Python test compilation check
-uv run python -m py_compile src/yeedu_mcp_server/main.py
+# Run the test suite - needs no API key and makes no network calls
+uv run --group dev pytest
+
+# Run one file, or one test
+uv run --group dev pytest tests/test_record_shapes.py
+uv run --group dev pytest -k confirm
+
+# Syntax check only
+uv run python -m compileall -q src/yeedu_mcp_server/
 ```
+
+The suite covers the pure response-formatting helpers (against response shapes captured from a live platform), the confirmation gate, the credential-handoff text, and structural invariants over the whole tool registry — that every tool registers, that every destructive tool exposes a `confirm` parameter defaulting to false, and that no tool accepts a parameter that would carry a secret value. Anything that depends on the platform's URL shapes or HTTP behaviour still needs a live call.
 
 ### Self-Signed SSL Certificates
 

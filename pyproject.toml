@@ -28,4 +28,9 @@ packages = ["src/yeedu_mcp_server"]
 [dependency-groups]
 dev = [
     "watchfiles>=1.2.0",
+    "pytest>=8",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
