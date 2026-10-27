@@ -10,9 +10,11 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 
-_DEFAULT_MAX_BYTES = 30 * 1024 * 1024  # 30 MB
-_DEFAULT_BACKUP_COUNT = 5
-_DEFAULT_LOG_DIR = "logs"
+# Disk ceiling per user is MAX_BYTES * (BACKUP_COUNT + 1) = 20 MB
+_DEFAULT_MAX_BYTES = 5 * 1024 * 1024  # 5 MB
+_DEFAULT_BACKUP_COUNT = 3
+# User-level so stdio launches (e.g. via uvx) don't drop logs/ into the client's cwd
+_DEFAULT_LOG_DIR = "~/.yeedu-mcp/logs"
 _DEFAULT_LOG_LEVEL = "INFO"
 _DEFAULT_LOG_FORMAT = (
     "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
@@ -66,7 +68,9 @@ def configure_logging(
     """
     normalized = _normalize_service_name(service_name)
 
-    resolved_log_dir = Path(log_dir or os.getenv("LOG_DIR", _DEFAULT_LOG_DIR))
+    resolved_log_dir = Path(
+        log_dir or os.getenv("LOG_DIR", _DEFAULT_LOG_DIR)
+    ).expanduser()
     resolved_log_dir.mkdir(parents=True, exist_ok=True)
 
     env_log_file_key = f"{normalized.upper()}_LOG_FILE"

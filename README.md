@@ -99,6 +99,9 @@ Environment variables configure the server via `pydantic-settings`:
 | `VERIFY_SSL` | optional | `false` | Enable strict TLS certificate verification |
 | `YEEDU_SSL_CERT_PATH` | optional | — | Custom CA bundle file path for self-signed certificates |
 | `LOG_LEVEL` | optional | `INFO` | Output logging verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+| `LOG_DIR` | optional | `~/.yeedu-mcp/logs` | Directory for the rotating log file (`yeedu-mcp-server.log`) |
+| `LOG_MAX_BYTES` | optional | `5242880` (5 MB) | Size at which the log file rotates |
+| `LOG_BACKUP_COUNT` | optional | `3` | Rotated files kept; total disk use is capped at about 20 MB |
 
 > **Configuration Precedence**: Environment variables set in the host environment or passed via client configuration (`mcpServers.env`) override local `.env` files.
 
