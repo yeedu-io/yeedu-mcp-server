@@ -422,7 +422,7 @@ async def get_cluster_details(
     annotations={"readOnlyHint": True}
 )
 async def get_cluster_events(
-    cluster_id: str = Field(description="ID of the cluster to filter events"),
+    cluster_id: int = Field(description="ID of the cluster to filter events"),
     limit: int = Field(
         default=20, ge=1, le=100, description="Number of events to retrieve"
     ),

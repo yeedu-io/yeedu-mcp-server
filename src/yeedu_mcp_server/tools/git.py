@@ -39,7 +39,7 @@ def _parse_file_paths(fp: Optional[Union[List[str], str]]) -> Optional[List[str]
 
 
 @mcp.tool(
-    description="Clones a Git repository (HTTPS URL) into a workspace folder. Optionally specify git_provider, branch, folder name, parent location (file_id or file_path), and git_credential_id for private repos. Returns CSV: workspace_id, git_url, branch, and any additional fields from the API response.",
+    description="Clones a Git repository (HTTPS URL) into a workspace folder. Optionally specify git_provider, branch, folder name, and parent location (file_id or file_path). Private repos use the user's stored Git credential for the provider. Returns CSV: workspace_id, git_url, branch, and any additional fields from the API response.",
     annotations={"idempotentHint": True}
 )
 async def git_clone_repo(
@@ -53,8 +53,6 @@ async def git_clone_repo(
         default=None, description="Branch to clone"),
     git_folder_name: Optional[str] = Field(
         default=None, description="Folder name for cloned repo (defaults to repo name)"),
-    git_credential_id: Optional[int] = Field(
-        default=None, description="Git credential ID for private repos"),
     file_id: Optional[int] = Field(
         default=None, description="Parent folder file ID where repo will be cloned"),
     file_path: Optional[str] = Field(
@@ -75,8 +73,6 @@ async def git_clone_repo(
             payload["git_branch"] = git_branch
         if git_folder_name:
             payload["git_folder_name"] = git_folder_name
-        if git_credential_id:
-            payload["git_credential_id"] = git_credential_id
 
         async with YeeduClient() as client:
             data = await client.post(
@@ -285,53 +281,13 @@ async def git_status(
 
 
 @mcp.tool(
-    description="Gets the diff (changed lines) for a specific file in a workspace Git folder. Requires workspace_id, file_path within the repo, and optional file_id (or folder file_path). Returns raw diff text.",
-    annotations={"readOnlyHint": True}
-)
-async def git_file_diff(
-    workspace_id: int = Field(description="Workspace ID"),
-    file_path: str = Field(
-        description="File path within the git folder to get diff for"),
-    file_id: Optional[int] = Field(
-        default=None, description="File ID of the Git folder (GIT_FOLDER type)"),
-) -> str:
-    """Get the diff of a file showing what has changed."""
-    try:
-        params = {
-            "workspace_id": workspace_id,
-            "file_path": file_path,
-        }
-        if file_id is not None:
-            params["file_id"] = file_id
-
-        async with YeeduClient() as client:
-            data = await client.get(
-                "/api/v1/workspace/files/git/file-diff", params=params
-            )
-
-            if isinstance(data, dict) and ("error_message" in data or "error" in data):
-                return f"Error: {data.get('error_message', data.get('error', 'Unknown'))}. HINT: Check if file_path is relative to the git repository root."
-
-            if isinstance(data, dict) and "diff" in data:
-                return data["diff"]
-            if isinstance(data, str):
-                return data
-            return str(data)
-
-    except Exception as e:
-        return f"Error getting file diff: {str(e)}. HINT: Verify the file_path is valid and modified."
-
-
-@mcp.tool(
-    description="Stages files in a workspace Git folder for the next commit. Use file_paths to stage specific files, or all_files=true to stage all changes. Returns CSV: action, file_id/file_path, files_staged, status.",
+    description="Stages files in a workspace Git folder for the next commit. Requires file_id of the Git folder (find it with browse_workspace_files). Use file_paths to stage specific files, or all_files=true to stage all changes. Returns CSV: action, file_id, files_staged, status.",
     annotations={"idempotentHint": True}
 )
 async def git_stage_files(
     workspace_id: int = Field(description="Workspace ID"),
-    file_id: Optional[int] = Field(
-        default=None, description="File ID of the Git folder (GIT_FOLDER type)"),
-    file_path: Optional[str] = Field(
-        default=None, description="Full file path to the Git folder in workspace"),
+    file_id: int = Field(
+        description="File ID of the Git folder (GIT_FOLDER type)"),
     file_paths: Optional[Union[List[str], str]] = Field(
         default=None, description="List of file paths to stage. If not provided, all changes are staged."),
     all_files: bool = Field(
@@ -339,19 +295,9 @@ async def git_stage_files(
 ) -> str:
     """Stage files for the next git commit. Use file_paths for specific files or all_files=true for all."""
     try:
-        has_file_id = isinstance(file_id, int)
-        has_file_path = isinstance(file_path, str) and bool(file_path)
-
-        if not has_file_id and not has_file_path:
-            return "Error: Either file_id or file_path must be provided to identify the Git folder."
-
         parsed_file_paths = _parse_file_paths(file_paths)
 
-        params = {"workspace_id": workspace_id}
-        if has_file_id:
-            params["file_id"] = file_id
-        if has_file_path:
-            params["file_path"] = file_path
+        params = {"workspace_id": workspace_id, "file_id": file_id}
         if parsed_file_paths:
             params["file_paths"] = parsed_file_paths
         else:
@@ -367,7 +313,7 @@ async def git_stage_files(
 
             lines = ["field,value"]
             lines.append("action,stage")
-            lines.append(f"file_id,{file_id if has_file_id else file_path}")
+            lines.append(f"file_id,{file_id}")
             if parsed_file_paths:
                 lines.append(f"files_staged,{len(parsed_file_paths)}")
             else:
@@ -380,24 +326,23 @@ async def git_stage_files(
 
 
 @mcp.tool(
-    description="Gets the diff (changed lines) for a specific file in a workspace Git folder. Requires workspace_id, file_path within the repo, and optional file_id (or folder file_path). Returns raw diff text.",
+    description="Gets the diff (changed lines) for a specific file in a workspace Git folder. Requires workspace_id, file_id of the Git folder (find it with browse_workspace_files), and file_path within the repo. Returns raw diff text.",
     annotations={"readOnlyHint": True}
 )
 async def git_file_diff(
     workspace_id: int = Field(description="Workspace ID"),
+    file_id: int = Field(
+        description="File ID of the Git folder (GIT_FOLDER type)"),
     file_path: str = Field(
         description="File path within the git folder to get diff for"),
-    file_id: Optional[int] = Field(
-        default=None, description="File ID of the Git folder (GIT_FOLDER type)"),
 ) -> str:
     """Get the diff of a file showing what has changed."""
     try:
         params = {
             "workspace_id": workspace_id,
+            "file_id": file_id,
             "file_path": file_path,
         }
-        if isinstance(file_id, int):
-            params["file_id"] = file_id
 
         async with YeeduClient() as client:
             data = await client.get(
@@ -418,16 +363,14 @@ async def git_file_diff(
 
 
 @mcp.tool(
-    description="Commits staged changes and pushes to the remote Git repository. Requires a commit_message. Optionally specify description, file_paths, or all_files=true. Returns CSV: action, commit_message, commit_hash (if returned by API), branch, status.",
+    description="Commits staged changes and pushes to the remote Git repository. Requires file_id of the Git folder (find it with browse_workspace_files) and a commit_message. Optionally specify description, file_paths, or all_files=true. Returns CSV: action, commit_message, commit_hash (if returned by API), branch, status.",
     annotations={"idempotentHint": True}
 )
 async def git_commit_push(
     workspace_id: int = Field(description="Workspace ID"),
     commit_message: str = Field(description="Commit message"),
-    file_id: Optional[int] = Field(
-        default=None, description="File ID of the Git folder (GIT_FOLDER type)"),
-    file_path: Optional[str] = Field(
-        default=None, description="Full file path to the Git folder in workspace"),
+    file_id: int = Field(
+        description="File ID of the Git folder (GIT_FOLDER type)"),
     description: Optional[str] = Field(
         default=None, description="Optional description for the commit"),
     file_paths: Optional[Union[List[str], str]] = Field(
@@ -437,22 +380,13 @@ async def git_commit_push(
 ) -> str:
     """Commit staged changes and push to remote. Requires commit_message."""
     try:
-        has_file_id = isinstance(file_id, int)
-        has_file_path = isinstance(file_path, str) and bool(file_path)
-
-        if not has_file_id and not has_file_path:
-            return "Error: Either file_id or file_path must be provided to identify the Git folder."
-
         parsed_file_paths = _parse_file_paths(file_paths)
 
         params = {
             "workspace_id": workspace_id,
+            "file_id": file_id,
             "commit_message": commit_message,
         }
-        if has_file_id:
-            params["file_id"] = file_id
-        if has_file_path:
-            params["file_path"] = file_path
         if isinstance(description, str) and description:
             params["description"] = description
 
@@ -485,7 +419,7 @@ async def git_commit_push(
 
 
 @mcp.tool(
-    description="Syncs a workspace Git folder with the remote: action=pull fetches and merges the latest remote changes; action=discard reverts local uncommitted changes (all files, or specific file_paths). Returns CSV: action, file_id/file_path, status."
+    description="Syncs a workspace Git folder with the remote: action=pull fetches and merges the latest remote changes (Git folder identified by file_id or file_path); action=discard reverts local uncommitted changes (all files, or specific file_paths) and requires file_id. Returns CSV: action, file_id/file_path, status."
 )
 async def git_sync(
     workspace_id: int = Field(description="Workspace ID"),
@@ -511,13 +445,16 @@ async def git_sync(
 
         if not has_file_id and not has_file_path:
             return "Error: Either file_id or file_path must be provided to identify the Git folder."
+        # The discard API only identifies the Git folder by file_id
+        if action == "discard" and not has_file_id:
+            return "Error: file_id is required for action=discard. HINT: Find the Git folder's file_id with browse_workspace_files."
 
         parsed_file_paths = _parse_file_paths(file_paths)
 
         params = {"workspace_id": workspace_id}
         if has_file_id:
             params["file_id"] = file_id
-        if has_file_path:
+        if has_file_path and action == "pull":
             params["file_path"] = file_path
 
         if action == "discard":
