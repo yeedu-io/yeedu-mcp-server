@@ -81,10 +81,10 @@ Security is built into the server's design through **Token Isolation**:
 The server is published on PyPI and runs with [`uvx`](https://docs.astral.sh/uv/guides/tools/), so there is nothing to clone or install by hand. Every client below runs the same command:
 
 ```bash
-uvx yeedu-mcp-server@latest
+uvx yeedu-mcp-server
 ```
 
-`uvx` downloads the package into a cached, isolated environment (and a matching Python if needed) on first launch. `@latest` makes it pick up new releases on each start; pin a version instead (`yeedu-mcp-server==0.1.0`) if you want fixed behaviour.
+`uvx` downloads the package into a cached, isolated environment (and a matching Python if needed) on first launch, then reuses that cache. To pick up a new release, run `uvx yeedu-mcp-server@latest` once (or use `@latest` in the config to check on every start); to pin a version, use `yeedu-mcp-server==0.1.0`.
 
 ### Prerequisites
 
@@ -136,7 +136,7 @@ In every example, replace `your-personal-access-token` and `https://your-yeedu-i
 claude mcp add --scope user yeedu \
   -e YEEDU_API_BASE_URL=https://your-yeedu-instance:8080 \
   -e YEEDU_API_KEY=your-personal-access-token \
-  -- uvx yeedu-mcp-server@latest
+  -- uvx yeedu-mcp-server
 ```
 
 `--scope user` makes it available in every project. Use `--scope project` to write a shareable `.mcp.json` into the repo instead, and keep the token out of it by referencing an environment variable (`"YEEDU_API_KEY": "${YEEDU_API_KEY}"`). Check with `claude mcp list` or `/mcp`.
@@ -154,7 +154,7 @@ Edit `claude_desktop_config.json`:
   "mcpServers": {
     "yeedu": {
       "command": "uvx",
-      "args": ["yeedu-mcp-server@latest"],
+      "args": ["yeedu-mcp-server"],
       "env": {
         "YEEDU_API_KEY": "your-personal-access-token",
         "YEEDU_API_BASE_URL": "https://your-yeedu-instance:8080"
@@ -170,7 +170,7 @@ Edit `claude_desktop_config.json`:
 codex mcp add yeedu \
   --env YEEDU_API_BASE_URL=https://your-yeedu-instance:8080 \
   --env YEEDU_API_KEY=your-personal-access-token \
-  -- uvx yeedu-mcp-server@latest
+  -- uvx yeedu-mcp-server
 ```
 
 Or add it to `~/.codex/config.toml` directly:
@@ -178,7 +178,7 @@ Or add it to `~/.codex/config.toml` directly:
 ```toml
 [mcp_servers.yeedu]
 command = "uvx"
-args = ["yeedu-mcp-server@latest"]
+args = ["yeedu-mcp-server"]
 
 [mcp_servers.yeedu.env]
 YEEDU_API_BASE_URL = "https://your-yeedu-instance:8080"
@@ -194,7 +194,7 @@ Open **Manage MCP Servers → View raw config** (or edit `~/.gemini/config/mcp_c
   "mcpServers": {
     "yeedu": {
       "command": "uvx",
-      "args": ["yeedu-mcp-server@latest"],
+      "args": ["yeedu-mcp-server"],
       "env": {
         "YEEDU_API_KEY": "your-personal-access-token",
         "YEEDU_API_BASE_URL": "https://your-yeedu-instance:8080"
@@ -218,7 +218,7 @@ Add to `opencode.json` (project root) or `~/.config/opencode/opencode.json`:
   "mcp": {
     "yeedu": {
       "type": "local",
-      "command": ["uvx", "yeedu-mcp-server@latest"],
+      "command": ["uvx", "yeedu-mcp-server"],
       "enabled": true,
       "environment": {
         "YEEDU_API_KEY": "your-personal-access-token",
@@ -246,7 +246,7 @@ Add to `.vscode/mcp.json` (or run **MCP: Add Server** from the command palette):
     "yeedu": {
       "type": "stdio",
       "command": "uvx",
-      "args": ["yeedu-mcp-server@latest"],
+      "args": ["yeedu-mcp-server"],
       "env": {
         "YEEDU_API_KEY": "your-personal-access-token",
         "YEEDU_API_BASE_URL": "https://your-yeedu-instance:8080"
@@ -258,7 +258,7 @@ Add to `.vscode/mcp.json` (or run **MCP: Add Server** from the command palette):
 
 ### Any other MCP client
 
-Configure a `stdio` server with command `uvx`, args `["yeedu-mcp-server@latest"]`, and the two environment variables above.
+Configure a `stdio` server with command `uvx`, args `["yeedu-mcp-server"]`, and the two environment variables above.
 
 ### Troubleshooting
 
@@ -281,7 +281,7 @@ To run one shared server over HTTP (`streamable-http`) instead of `stdio`:
 
 ```bash
 YEEDU_API_KEY=your-token YEEDU_API_BASE_URL=https://your-yeedu-instance:8080 \
-  uvx yeedu-mcp-server@latest --transport streamable-http
+  uvx yeedu-mcp-server --transport streamable-http
 ```
 
 The server listens on `http://127.0.0.1:8000/mcp` (see `YEEDU_MCP_SERVER_URL`). Every request uses the single `YEEDU_API_KEY` it was started with, so run one instance per user.
