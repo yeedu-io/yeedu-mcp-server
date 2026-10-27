@@ -78,11 +78,30 @@ Security is built into the server's design through **Token Isolation**:
 
 ## Quick Start
 
+The server is published on PyPI and runs with [`uvx`](https://docs.astral.sh/uv/guides/tools/), so there is nothing to clone or install by hand. Every client below runs the same command:
+
+```bash
+uvx yeedu-mcp-server@latest
+```
+
+`uvx` downloads the package into a cached, isolated environment (and a matching Python if needed) on first launch. `@latest` makes it pick up new releases on each start; pin a version instead (`yeedu-mcp-server==0.1.0`) if you want fixed behaviour.
+
 ### Prerequisites
 
-- **Python**: `3.12+`
-- **Package Manager**: [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`
-- **Platform Access**: An active Yeedu instance URL and a Personal Access Token (PAT).
+1. **Install `uv`** (once per machine; it provides `uvx`):
+
+   ```bash
+   # macOS / Linux
+   curl -LsSf https://astral.sh/uv/install.sh | sh
+   # Windows
+   powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+   ```
+
+2. **Create a Personal Access Token** in the Yeedu UI (profile → tokens).
+
+3. **Find your API base URL.** This is the Yeedu **API** address, usually the UI host on port `8080` (e.g. `https://demo.yeedu.io:8080`). Do not use the UI address itself or add `/api/v1`. To check, `curl -k https://<host>:8080/api/v1/user` should return a JSON message, not an HTML page.
+
+Python 3.12+ is required, but `uvx` fetches it automatically if it is missing.
 
 ---
 
@@ -109,9 +128,22 @@ Environment variables configure the server via `pydantic-settings`:
 
 ## Client Integration Setup
 
+In every example, replace `your-personal-access-token` and `https://your-yeedu-instance:8080` with your own values. Restart (or reload MCP in) the client after editing its config.
+
+### Claude Code
+
+```bash
+claude mcp add --scope user yeedu \
+  -e YEEDU_API_BASE_URL=https://your-yeedu-instance:8080 \
+  -e YEEDU_API_KEY=your-personal-access-token \
+  -- uvx yeedu-mcp-server@latest
+```
+
+`--scope user` makes it available in every project. Use `--scope project` to write a shareable `.mcp.json` into the repo instead, and keep the token out of it by referencing an environment variable (`"YEEDU_API_KEY": "${YEEDU_API_KEY}"`). Check with `claude mcp list` or `/mcp`.
+
 ### Claude Desktop
 
-Add the server entry to your `claude_desktop_config.json`:
+Edit `claude_desktop_config.json`:
 
 - **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
 - **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
@@ -121,13 +153,8 @@ Add the server entry to your `claude_desktop_config.json`:
 {
   "mcpServers": {
     "yeedu": {
-      "command": "uv",
-      "args": [
-        "run",
-        "--directory",
-        "/path/to/yeedu-mcp-server",
-        "yeedu-mcp-server"
-      ],
+      "command": "uvx",
+      "args": ["yeedu-mcp-server@latest"],
       "env": {
         "YEEDU_API_KEY": "your-personal-access-token",
         "YEEDU_API_BASE_URL": "https://your-yeedu-instance:8080"
@@ -137,20 +164,127 @@ Add the server entry to your `claude_desktop_config.json`:
 }
 ```
 
-### Cursor / Windsurf / Custom MCP Clients
-
-For standard `stdio` transport, launch the server command directly in your client settings:
+### OpenAI Codex
 
 ```bash
-YEEDU_API_KEY=your-token YEEDU_API_BASE_URL=https://your-yeedu-instance:8080 uv run yeedu-mcp-server
+codex mcp add yeedu \
+  --env YEEDU_API_BASE_URL=https://your-yeedu-instance:8080 \
+  --env YEEDU_API_KEY=your-personal-access-token \
+  -- uvx yeedu-mcp-server@latest
 ```
 
-For HTTP remote integration (`streamable-http`):
+Or add it to `~/.codex/config.toml` directly:
+
+```toml
+[mcp_servers.yeedu]
+command = "uvx"
+args = ["yeedu-mcp-server@latest"]
+
+[mcp_servers.yeedu.env]
+YEEDU_API_BASE_URL = "https://your-yeedu-instance:8080"
+YEEDU_API_KEY = "your-personal-access-token"
+```
+
+### Google Antigravity (IDE and `agy` CLI)
+
+Open **Manage MCP Servers → View raw config** (or edit `~/.gemini/config/mcp_config.json`; older builds use `~/.gemini/antigravity/mcp_config.json`) and add:
+
+```json
+{
+  "mcpServers": {
+    "yeedu": {
+      "command": "uvx",
+      "args": ["yeedu-mcp-server@latest"],
+      "env": {
+        "YEEDU_API_KEY": "your-personal-access-token",
+        "YEEDU_API_BASE_URL": "https://your-yeedu-instance:8080"
+      }
+    }
+  }
+}
+```
+
+### Gemini CLI
+
+Add the same `mcpServers` block as Antigravity to `~/.gemini/settings.json` (or `.gemini/settings.json` in a project).
+
+### OpenCode
+
+Add to `opencode.json` (project root) or `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "yeedu": {
+      "type": "local",
+      "command": ["uvx", "yeedu-mcp-server@latest"],
+      "enabled": true,
+      "environment": {
+        "YEEDU_API_KEY": "your-personal-access-token",
+        "YEEDU_API_BASE_URL": "https://your-yeedu-instance:8080"
+      }
+    }
+  }
+}
+```
+
+### Cursor / Windsurf
+
+Use the same `mcpServers` block as Claude Desktop in:
+
+- **Cursor**: `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (project)
+- **Windsurf**: `~/.codeium/windsurf/mcp_config.json`
+
+### VS Code (GitHub Copilot)
+
+Add to `.vscode/mcp.json` (or run **MCP: Add Server** from the command palette):
+
+```json
+{
+  "servers": {
+    "yeedu": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["yeedu-mcp-server@latest"],
+      "env": {
+        "YEEDU_API_KEY": "your-personal-access-token",
+        "YEEDU_API_BASE_URL": "https://your-yeedu-instance:8080"
+      }
+    }
+  }
+}
+```
+
+### Any other MCP client
+
+Configure a `stdio` server with command `uvx`, args `["yeedu-mcp-server@latest"]`, and the two environment variables above.
+
+### Troubleshooting
+
+- **`uvx: command not found` / server fails to start in a desktop app.** GUI apps often don't inherit your shell `PATH`. Use the absolute path from `which uvx` (macOS/Linux) or `where uvx` (Windows) as the `command`.
+- **Tools return HTML or 404s.** `YEEDU_API_BASE_URL` points at the UI, not the API. Use the API host and port (typically `:8080`).
+- **401 / "Auth Token not found".** The token is missing or expired; create a new PAT.
+- **Logs** are written to `~/.yeedu-mcp/logs/yeedu-mcp-server.log` (rotating, capped at about 20 MB).
+
+### Running from source
+
+For development, point the client at a local checkout instead of `uvx`:
 
 ```bash
-# Server launch
-YEEDU_API_KEY=your-token YEEDU_API_BASE_URL=https://your-yeedu-instance:8080 uv run yeedu-mcp-server --transport streamable-http
+uv run --directory /path/to/yeedu-mcp-server yeedu-mcp-server
 ```
+
+### Remote HTTP mode
+
+To run one shared server over HTTP (`streamable-http`) instead of `stdio`:
+
+```bash
+YEEDU_API_KEY=your-token YEEDU_API_BASE_URL=https://your-yeedu-instance:8080 \
+  uvx yeedu-mcp-server@latest --transport streamable-http
+```
+
+The server listens on `http://127.0.0.1:8000/mcp` (see `YEEDU_MCP_SERVER_URL`). Every request uses the single `YEEDU_API_KEY` it was started with, so run one instance per user.
 
 ---
 
