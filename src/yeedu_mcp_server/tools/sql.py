@@ -25,11 +25,11 @@ from yeedu_mcp_server.config import settings
 from yeedu_mcp_server.mcp_server import mcp
 from yeedu_mcp_server.utils.confirm import confirmation_required, confirmed
 from yeedu_mcp_server.utils.formatting import serialize_table
+from yeedu_mcp_server.utils.sql_targets import SqlTargetError, get_sql_target
 from yeedu_mcp_server.utils.thrift_conn import (
     ThriftUnavailableError,
     build_thrift_url,
     get_connection_username,
-    get_thrift_connection,
     ssl_context_for,
 )
 
@@ -52,6 +52,19 @@ def _is_multi_statement(sql: str) -> bool:
     body = _COMMENT.sub(" ", sql)
     head, sep, tail = body.partition(";")
     return bool(sep) and bool(tail.strip())
+
+
+#: Spark's wording for an object that is not in the session's catalog. The
+#: cause is just as often that the cluster is bound to a different metastore
+#: catalog than that the name is wrong, so the hint has to name the catalog.
+_MISSING_OBJECT = re.compile(
+    r"TABLE_OR_VIEW_NOT_FOUND|SCHEMA_NOT_FOUND|NoSuchDatabase|NoSuchTable"
+    r"|Table or view not found|Database '.*' not found",
+    re.I)
+
+
+def _is_missing_object(exc: Exception) -> bool:
+    return bool(_MISSING_OBJECT.search(str(exc)))
 
 
 # Whether the Thrift route accepts a Bearer header. None until the first
@@ -129,9 +142,13 @@ def _execute(url, auth_header, sql, database, fetch_n, timeout_sec):
         "returns the result set with column names. Use this to query tables "
         "rather than submitting a Spark SQL job — it returns typed rows "
         "immediately instead of unlabelled text in a run's STDOUT. The cluster "
-        "must be RUNNING and have thrift support, and the workspace must be "
-        "attached to it. Read-only statements run directly; anything that "
-        "writes requires confirm=True."
+        "must be RUNNING, have thrift support, be attached to the workspace, "
+        "and be bound to the metastore catalog the tables live in; all four are "
+        "checked before connecting and reported individually. When the "
+        "cluster_id is not already known, call find_sql_clusters first and let "
+        "the user choose — and find_metastore_for_object before that if they "
+        "named a table without saying which metastore. Read-only statements "
+        "run directly; anything that writes requires confirm=True."
     ),
     annotations={"readOnlyHint": False},
 )
@@ -184,11 +201,16 @@ async def run_sql(
             include_action=False,
         )
 
+    # Preflight the pair rather than discovering a problem as a socket error:
+    # thrift support, workspace attachment and RUNNING each fail for a
+    # different reason and each has a different fix.
     try:
-        conn = await get_thrift_connection(cluster_id, workspace_id)
-    except ThriftUnavailableError as exc:
+        target = await get_sql_target(cluster_id, workspace_id)
+    except SqlTargetError as exc:
         return f"Error: {exc}"
 
+    conn = target["endpoint"]
+    catalog = target["catalog_label"]
     url = build_thrift_url(conn)
     token = settings.yeedu_api_key
 
@@ -241,11 +263,26 @@ async def run_sql(
         logger.warning("run_sql failed on cluster %s: %s: %s",
                        cluster_id, type(exc).__name__,
                        _redact(str(exc), *secrets))
+        if _is_missing_object(exc):
+            hint = (
+                f"Hint: cluster {cluster_id} is bound to metastore catalog "
+                f"{catalog}, and a schema or table in any other catalog is "
+                f"invisible to this session — the name being wrong is only one "
+                f"of the two explanations. Use "
+                f"find_metastore_for_object(name=..., "
+                f"workspace_id={workspace_id}) to find which catalog holds it, "
+                f"then find_sql_clusters(metastore_catalog_id=...) to pick a "
+                f"cluster bound to that catalog."
+            )
+        else:
+            hint = (
+                f"Hint: the cluster was RUNNING with a live endpoint when the "
+                f"query was submitted, so check that the statement is valid "
+                f"Spark SQL for metastore catalog {catalog}."
+            )
         return (
             f"Error: the SQL query did not complete ({type(exc).__name__}): "
-            f"{detail}\n"
-            f"Hint: check that the statement is valid Spark SQL and that the "
-            f"table exists in the metastore catalog the cluster is bound to."
+            f"{detail}\n{hint}"
         )
 
     if not headers:

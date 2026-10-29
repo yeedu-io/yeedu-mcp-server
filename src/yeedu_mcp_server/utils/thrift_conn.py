@@ -1,10 +1,10 @@
-"""Thrift (HiveServer2) connection discovery.
+"""Thrift (HiveServer2) transport helpers.
 
 The platform serves a HiveServer2 endpoint in HTTP transport mode for every
-(cluster, workspace) pair whose cluster has thrift support. Its coordinates are
-returned by the API as a `thrift_connection` object on
-`/api/v1/ac/cluster/{cluster_id}/workspaces` — the same payload that
-`get_cluster_workspaces` already reads.
+(cluster, workspace) pair whose cluster has thrift support. Its coordinates
+arrive as a `thrift_connection` object, which `sql_targets.get_sql_target`
+reads along with the rest of the preflight; the helpers here turn that record
+into a URL, an SSL context and a username.
 
 Connection coordinates and the bearer token are internal. They are used to open
 a transport and are never returned to a caller, logged at INFO, or rendered into
@@ -21,47 +21,6 @@ from yeedu_mcp_server.config import settings
 
 class ThriftUnavailableError(Exception):
     """No Thrift endpoint is published for this cluster/workspace pair."""
-
-
-async def get_thrift_connection(cluster_id: int, workspace_id: int) -> Dict[str, Any]:
-    """Return the `thrift_connection` record for a (cluster, workspace) pair.
-
-    Raises ThriftUnavailableError if the workspace is not attached to the
-    cluster, or the cluster publishes no Thrift endpoint.
-    """
-    endpoint = f"/api/v1/ac/cluster/{cluster_id}/workspaces"
-    page = 1
-
-    async with YeeduClient() as client:
-        while True:
-            data = await client.get(
-                endpoint, params={"limit": 100, "pageNumber": page}
-            )
-            rows = (data or {}).get("data") or []
-            for row in rows:
-                ws = row.get("workspace") or {}
-                if ws.get("workspace_id") != workspace_id:
-                    continue
-                conn = row.get("thrift_connection")
-                if not conn or not conn.get("host"):
-                    raise ThriftUnavailableError(
-                        f"Cluster {cluster_id} publishes no Thrift endpoint for "
-                        f"workspace {workspace_id}. Thrift SQL requires a cluster "
-                        f"whose Spark version has thrift_support enabled — check "
-                        f"get_cluster_details({cluster_id})."
-                    )
-                return conn
-
-            result_set = (data or {}).get("result_set") or {}
-            total_pages = result_set.get("total_pages") or 1
-            if page >= total_pages or not rows:
-                break
-            page += 1
-
-    raise ThriftUnavailableError(
-        f"Workspace {workspace_id} is not attached to cluster {cluster_id}. "
-        f"Use get_cluster_workspaces({cluster_id}) to list the ones that are."
-    )
 
 
 def build_thrift_url(conn: Dict[str, Any]) -> str:
