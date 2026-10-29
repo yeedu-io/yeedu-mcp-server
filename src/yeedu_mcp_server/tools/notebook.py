@@ -434,8 +434,19 @@ def _ws_ssl_context(ws_url: str):
     return ssl.create_default_context()
 
 
+_CONNECTABLE_KERNEL_STATES = ("idle", "busy", "starting")
+
+
 async def _wait_for_kernel(client, workspace_id: int, run_id: int, timeout_sec: int = 90) -> str:
-    """Start the kernel if needed and wait until it is idle/busy. Returns the final kernel status."""
+    """Start the kernel if needed and wait until it can be connected to. Returns the last status.
+
+    A kernel that has been launched reports "starting" until a client connects to its
+    websocket, and this server is that client - so "starting" is a state to connect in,
+    not one to wait out. Waiting for "idle" first would deadlock: the status cannot leave
+    "starting" while nothing connects. The kernel buffers the execute request if its Spark
+    session is still coming up, and a kernel that never comes up is caught by the caller's
+    own timeout instead.
+    """
     base = f"/api/v1/workspace/{workspace_id}/notebook/run/{run_id}/kernel"
     await client.post(f"{base}/startOrGetStatus")
     status = "unknown"
@@ -444,7 +455,7 @@ async def _wait_for_kernel(client, workspace_id: int, run_id: int, timeout_sec: 
         info = info if isinstance(info, dict) else {}
         status = str(info.get("kernel_status") or info.get("execution_state")
                      or info.get("status") or "unknown").lower()
-        if status in ("idle", "busy"):
+        if status in _CONNECTABLE_KERNEL_STATES:
             return status
         await asyncio.sleep(3)
     return status
@@ -593,8 +604,10 @@ async def execute_notebook_code(
         async with YeeduClient() as client:
             token = client.token
             status = await _wait_for_kernel(client, workspace_id, run_id)
-            if status not in ("idle", "busy"):
-                return f"Error: kernel is not ready (status: {status}). HINT: The notebook run must be RUNNING; check it with get_notebook_run."
+            if status not in _CONNECTABLE_KERNEL_STATES:
+                return (f"Error: kernel of notebook run {run_id} is in state {status}, which cannot be "
+                        "connected to. HINT: Check the run with get_notebook_run - if it is RUNNING, "
+                        "restart the kernel with notebook_kernel_action 'restart'.")
             # Registers the websocket proxy for this run/session token
             await client.get(
                 f"/api/v1/workspace/{workspace_id}/notebook/run/{run_id}/kernel/ws",
@@ -697,8 +710,9 @@ async def run_notebook_cells(
                 return f"Error: notebook run {run_id} is in state {run_status}, not RUNNING. HINT: Start a run with start_notebook and retry."
 
             status = await _wait_for_kernel(client, workspace_id, run_id)
-            if status not in ("idle", "busy"):
-                return f"Error: kernel is not ready (status: {status}). HINT: Start it with start_notebook_kernel."
+            if status not in _CONNECTABLE_KERNEL_STATES:
+                return (f"Error: kernel of notebook run {run_id} is in state {status}, which cannot be "
+                        "connected to. HINT: Restart it with notebook_kernel_action 'restart'.")
 
             # The notebook/run/download endpoint only serves batch runs, so read the
             # notebook from its workspace file instead (works for interactive runs too).

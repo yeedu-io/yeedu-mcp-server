@@ -1,5 +1,6 @@
 """Spark job definitions, execution control, and log monitoring tools for Yeedu MCP Server."""
 
+import asyncio
 import json
 from typing import List, Optional
 from pydantic import Field
@@ -894,8 +895,22 @@ async def create_notebook(
         return f"Error creating notebook: {str(e)}. HINT: Ensure the cluster supports notebooks and notebook_name is unique in the workspace."
 
 
+async def _wait_for_run_running(client, workspace_id: int, run_id: int, timeout_sec: int) -> str:
+    """Poll a notebook run until it leaves SUBMITTED. Returns the last run_status seen."""
+    status = "UNKNOWN"
+    for _ in range(max(1, timeout_sec // 5)):
+        run = await client.get(
+            f"/api/v1/workspace/{workspace_id}/notebook/run/{run_id}")
+        run = run if isinstance(run, dict) else {}
+        status = str(run.get("run_status") or "UNKNOWN")
+        if status != "SUBMITTED":
+            return status
+        await asyncio.sleep(5)
+    return status
+
+
 @mcp.tool(
-    description="Starts a notebook run for a notebook configuration (use notebook_id from create_notebook or the job listing) and starts its kernel. The attached cluster must be RUNNING. Optionally pass runtime_arguments and runtime_conf (Spark conf overrides for this run only). Returns the new run details and kernel status."
+    description="Starts a notebook run for a notebook configuration (use notebook_id from create_notebook or the job listing) and starts its kernel. The attached cluster must be RUNNING. A new run takes a minute or two to leave SUBMITTED, and the kernel is started once it reaches RUNNING; pass start_kernel=False to skip that wait. Optionally pass runtime_arguments and runtime_conf (Spark conf overrides for this run only). Returns the new run details and kernel status."
 )
 async def start_notebook(
     workspace_id: int = Field(
@@ -903,6 +918,9 @@ async def start_notebook(
     notebook_id: int = Field(description="ID of the notebook to start"),
     start_kernel: bool = Field(
         default=True, description="Also start the notebook kernel once the run is created"),
+    kernel_wait_sec: int = Field(
+        default=240, ge=0, le=900,
+        description="Seconds to wait for the new run to reach RUNNING before starting its kernel"),
     runtime_arguments: Optional[str] = Field(
         default=None, description="Runtime arguments for the notebook"),
     runtime_conf: Optional[List[str]] = Field(
@@ -924,11 +942,26 @@ async def start_notebook(
             result = f"Notebook run started successfully: {run}"
 
             run_id = run.get("run_id") if isinstance(run, dict) else None
-            if start_kernel and run_id:
+            if not (start_kernel and run_id):
+                return result
+
+            # The run is created asynchronously and sits in SUBMITTED until the cluster
+            # allocates its driver; starting the kernel before that is rejected. Everything
+            # below is reported alongside the run details rather than raised, so that a
+            # kernel that is not up yet never hides the run_id the caller needs next.
+            status = await _wait_for_run_running(client, workspace_id, run_id, kernel_wait_sec)
+            if status != "RUNNING":
+                return (f"{result}\nKernel: not started - run {run_id} is in state {status}. "
+                        f"The run exists; poll get_notebook_run with run_id {run_id} and call "
+                        f"start_notebook_kernel once it is RUNNING.")
+            try:
                 kernel = await client.post(
                     f"/api/v1/workspace/{workspace_id}/notebook/run/{run_id}/kernel/startOrGetStatus"
                 )
                 result += f"\nKernel: {kernel}"
+            except Exception as kernel_error:
+                result += (f"\nKernel: not started ({kernel_error}). The run {run_id} exists; "
+                           f"retry with start_notebook_kernel and run_id {run_id}.")
             return result
 
     except Exception as e:
@@ -952,7 +985,9 @@ async def start_notebook_kernel(
             return f"Notebook kernel status: {data}"
 
     except Exception as e:
-        return f"Error starting notebook kernel: {str(e)}. HINT: The notebook run must be RUNNING; check its status with workspace_job_runs."
+        return (f"Error starting notebook kernel: {str(e)}. HINT: Check the run with get_notebook_run - "
+                "a run in SUBMITTED is still coming up, so wait and retry with the same run_id; "
+                "a run in STOPPED or ERROR needs a new run from start_notebook.")
 
 
 @mcp.tool(
