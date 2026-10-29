@@ -304,10 +304,17 @@ def _table_name_of(item: Any) -> Optional[str]:
 
 
 async def _browse(client: YeeduClient, catalog_id: int, object_type: str,
-                  workspace_id: int, catalog_name: Optional[str] = None,
+                  workspace_id: Optional[int] = None,
+                  catalog_name: Optional[str] = None,
                   schema_name: Optional[str] = None) -> List[Any]:
-    """One metastore browse call. Browse endpoints take no pagination."""
-    params: Dict[str, Any] = {"workspace_id": workspace_id}
+    """One metastore browse call. Browse endpoints take no pagination.
+
+    workspace_id is optional upstream — it only selects workspace-scoped
+    catalog credentials — so it is omitted rather than sent as null.
+    """
+    params: Dict[str, Any] = {}
+    if workspace_id is not None:
+        params["workspace_id"] = workspace_id
     if catalog_name:
         params["catalog_name"] = catalog_name
     if schema_name:
@@ -329,7 +336,7 @@ _NEEDS_CATALOG_NAME = re.compile(r"catalog name is required", re.I)
 
 
 async def _schema_listing(client: YeeduClient, catalog: Dict[str, Any],
-                          workspace_id: int
+                          workspace_id: Optional[int] = None
                           ) -> List[Tuple[Optional[str], List[str]]]:
     """Return (namespace, schema names) pairs for a catalog.
 
@@ -367,7 +374,7 @@ async def _schema_listing(client: YeeduClient, catalog: Dict[str, Any],
     return pairs
 
 
-async def search_metastores(name: str, workspace_id: int,
+async def search_metastores(name: str, workspace_id: Optional[int] = None,
                             max_schemas_per_catalog: int = 100
                             ) -> List[Dict[str, Any]]:
     """Find which metastore catalogs hold a schema or table called `name`.

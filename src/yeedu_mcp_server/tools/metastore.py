@@ -59,13 +59,16 @@ async def list_metastore_catalogs(
 
 
 @mcp.tool(
-    description="Browses objects within a metastore catalog: catalogs, schemas, tables, table_summaries, functions, or volumes. Requires metastore_catalog_id and workspace_id. To get the initial list of catalogs for Unity/Databricks metastores, set object_type='catalogs' (catalog_name is not needed). For other object types (schemas, tables, table_summaries, functions, volumes) in Unity/Databricks metastores, catalog_name is required. For Hive metastores, schema_name is required for tables/functions/volumes. Returns CSV with object-type-specific columns.",
+    description="Browses objects within a metastore catalog: catalogs, schemas, tables, table_summaries, functions, or volumes. Requires metastore_catalog_id; workspace_id is optional and only needed when the catalog's credentials are workspace-scoped. Note that table_summaries covers the whole metastore and takes no schema_name — use object_type='tables' to list one schema. To get the initial list of catalogs for Unity/Databricks metastores, set object_type='catalogs' (catalog_name is not needed). For other object types (schemas, tables, table_summaries, functions, volumes) in Unity/Databricks metastores, catalog_name is required. For Hive metastores, schema_name is required for tables/functions/volumes. Returns CSV with object-type-specific columns.",
     annotations={"readOnlyHint": True}
 )
 async def browse_catalog(
     metastore_catalog_id: int = Field(description="Metastore catalog ID"),
-    workspace_id: int = Field(
-        description="Workspace ID (required for metastore browse APIs)"),
+    workspace_id: Optional[int] = Field(
+        default=None,
+        description="Workspace ID. Optional — supply it only when this "
+                    "catalog's credentials are linked at workspace scope; "
+                    "omit it to resolve user- or tenant-scoped credentials."),
     object_type: str = Field(
         description="What to browse: catalogs, schemas, tables, table_summaries, functions, or volumes"
     ),
@@ -83,15 +86,34 @@ async def browse_catalog(
         if object_type not in valid_types:
             return f"Error: Invalid object_type '{object_type}'. Must be one of: {', '.join(valid_types)}"
 
-        # Browse endpoints do not support pageNumber/limit — omit them
-        params: dict = {"workspace_id": workspace_id}
+        workspace_id = opt(workspace_id)
+        schema_name = opt(schema_name)
+        catalog_name = opt(catalog_name)
+        search_name = opt(search_name)
+
+        # Browse endpoints do not support pageNumber/limit — omit them.
+        # workspace_id is optional upstream: it only selects workspace-scoped
+        # catalog credentials, so omit it entirely rather than sending null.
+        params: dict = {}
+        if workspace_id is not None:
+            params["workspace_id"] = workspace_id
 
         # catalog_name accepted by object types other than catalogs
         if catalog_name:
             params["catalog_name"] = catalog_name
-        # schema_name accepted by tables, functions, volumes
+        # schema_name accepted by tables, functions, volumes only. The
+        # table_summaries endpoint has no such parameter, so a schema_name
+        # passed there would be dropped — say so instead of silently
+        # returning every table in the metastore as if it were filtered.
         if schema_name and object_type in ("tables", "functions", "volumes"):
             params["schema_name"] = schema_name
+        elif schema_name:
+            return (
+                f"Error: object_type='{object_type}' does not accept "
+                f"schema_name; it covers the whole metastore. "
+                f"HINT: call browse_catalog with object_type='tables' and "
+                f"schema_name='{schema_name}' to list just that schema."
+            )
 
         async with YeeduClient() as client:
             # Only /catalogs has a /search sub-endpoint
@@ -202,8 +224,11 @@ async def browse_catalog(
 )
 async def get_table_details(
     metastore_catalog_id: int = Field(description="Metastore catalog ID"),
-    workspace_id: int = Field(
-        description="Workspace ID (required for metastore APIs)"),
+    workspace_id: Optional[int] = Field(
+        default=None,
+        description="Workspace ID. Optional — supply it only when this "
+                    "catalog's credentials are linked at workspace scope; "
+                    "omit it to resolve user- or tenant-scoped credentials."),
     detail_type: str = Field(description="Type of detail: ddl or columns"),
     schema_name: str = Field(
         description="Schema/database name containing the table"),
@@ -214,6 +239,9 @@ async def get_table_details(
 ) -> str:
     """Get DDL statement or column definitions for a table."""
     try:
+        workspace_id = opt(workspace_id)
+        catalog_name = opt(catalog_name)
+
         valid_types = ["ddl", "columns"]
         if detail_type not in valid_types:
             return f"Error: Invalid detail_type '{detail_type}'. Must be: ddl or columns"
@@ -230,7 +258,8 @@ async def get_table_details(
 
                 data = await client.post(
                     f"/api/v1/metastore/{metastore_catalog_id}/table_ddl",
-                    params={"workspace_id": workspace_id},
+                    params=({"workspace_id": workspace_id}
+                            if workspace_id is not None else None),
                     json=[table_ref],
                 )
 
@@ -254,10 +283,11 @@ async def get_table_details(
 
             else:  # columns
                 params: dict = {
-                    "workspace_id": workspace_id,
                     "schema_name": schema_name,
                     "table_name": table_name,
                 }
+                if workspace_id is not None:
+                    params["workspace_id"] = workspace_id
                 if catalog_name:
                     params["catalog_name"] = catalog_name
 

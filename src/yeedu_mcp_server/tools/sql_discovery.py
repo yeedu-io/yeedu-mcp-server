@@ -16,6 +16,7 @@ from pydantic import Field
 from yeedu_mcp_server.mcp_server import mcp
 from yeedu_mcp_server.utils.formatting import serialize_table
 from yeedu_mcp_server.utils.errors import APIError
+from yeedu_mcp_server.utils.params import opt
 from yeedu_mcp_server.utils.sql_targets import (
     SqlTargetError,
     catalog_label,
@@ -284,8 +285,10 @@ async def find_sql_clusters(
 async def find_metastore_for_object(
     name: str = Field(
         description="Schema, table, or 'schema.table' to locate"),
-    workspace_id: int = Field(
-        description="Workspace to browse as. Scopes authorisation only; it "
+    workspace_id: Optional[int] = Field(
+        default=None,
+        description="Workspace to browse as. Optional — supply it only when a "
+                    "catalog's credentials are linked at workspace scope. It "
                     "does not restrict which catalogs are searched."),
     max_schemas_per_catalog: int = Field(
         default=100, ge=1, le=1000,
@@ -295,6 +298,9 @@ async def find_metastore_for_object(
                     "like a clean miss."),
 ) -> str:
     """Locate the metastore catalogs holding a named schema or table."""
+    workspace_id = opt(workspace_id)
+    max_schemas_per_catalog = opt(max_schemas_per_catalog) or 100
+
     target = (name or "").strip()
     if not target:
         return "Error: name is empty. Hint: pass a table, schema, or 'schema.table'."
@@ -386,10 +392,14 @@ async def find_metastore_for_object(
         )
     else:
         only = matched[0]
+        # workspace_id is optional here, so it must not be echoed into the
+        # suggested call as the literal "None" — an agent would pass it back.
+        ws_arg = (f", workspace_id={workspace_id}"
+                  if workspace_id is not None else "")
         lines.append(
             f"Only metastore catalog {catalog_label(only)} holds it. Next: "
-            f"find_sql_clusters(metastore_catalog_id={only['catalog_id']}, "
-            f"workspace_id={workspace_id}) to see which clusters can query it, "
+            f"find_sql_clusters(metastore_catalog_id={only['catalog_id']}"
+            f"{ws_arg}) to see which clusters can query it, "
             f"then ask the user to pick one."
         )
 
