@@ -46,6 +46,7 @@ def confirmation_required(
     record: Optional[str] = None,
     impact: Optional[str] = None,
     retry: Optional[str] = None,
+    include_action: bool = True,
 ) -> str:
     """Return the message that stands in for performing a destructive action.
 
@@ -57,6 +58,10 @@ def confirmation_required(
         record: The row read back from the platform, when it could be read.
         impact: What else breaks, in one sentence.
         retry: The exact arguments to retry with, minus confirm.
+        include_action: Whether the tool takes an `action` parameter. The
+            `manage_*` tools do, so their retry line needs it. Tools that name
+            their verb in the tool name itself do not, and printing one there
+            would hand back a call signature that does not exist.
     """
     # "delete" → "deleted", "unassign" → "unassigned".
     past = action + ("d" if action.endswith("e") else "ed")
@@ -73,9 +78,10 @@ def confirmation_required(
         lines += ["", f"Impact: {impact}"]
 
     args = f"{retry}, confirm=True" if retry else "confirm=True"
+    signature = f"{tool}(action='{action}', {args})" if include_action else f"{tool}({args})"
     lines += [
         "",
         f"Ask the user to confirm, then repeat the call with confirm=True: "
-        f"{tool}(action='{action}', {args})",
+        f"{signature}",
     ]
     return "\n".join(lines)

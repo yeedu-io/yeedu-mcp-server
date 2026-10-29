@@ -17,6 +17,8 @@ dependencies = [
     "anyio",
     "tenacity>=8.0.0",
     "websockets>=12",
+    "pyhive>=0.7.0",
+    "thrift>=0.16.0",
 ]
 
 [project.scripts]

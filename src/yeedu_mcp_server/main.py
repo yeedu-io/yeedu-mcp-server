@@ -44,6 +44,7 @@ import yeedu_mcp_server.tools.storage       # noqa: F401
 import yeedu_mcp_server.tools.secrets       # noqa: F401
 import yeedu_mcp_server.tools.tenants       # noqa: F401
 import yeedu_mcp_server.tools.reference     # noqa: F401
+import yeedu_mcp_server.tools.sql           # noqa: F401
 import yeedu_mcp_server.prompts             # noqa: F401
 
 
