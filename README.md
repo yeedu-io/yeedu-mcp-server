@@ -60,7 +60,10 @@ graph LR
 - **Integrated Git Workflows**: Clone HTTPS repositories, manage/switch branches, view file diffs, stage changes, commit/push to remote repositories, and sync/discard local modifications.
 - **Metastore & Catalog Discovery**: Explore Hive, Unity, and Glue metastores; browse schemas, tables, functions, and volumes; extract column schemas and table DDL statements.
 - **Object Storage Management**: Inspect Object Storage Managers (OSM), list bucket contents, download file content, and delete storage objects across cloud providers.
-- **Billing & Cost Analytics**: Generate detailed billing reports (up to 90 days) analyzing total runtime minutes, YCU (Yeedu Compute Unit) consumption, and per-cluster cost breakdowns.
+- **SQL Querying**: Run SQL against a cluster's metastore over Thrift and get rows back, with the catalog the query resolved against reported alongside them.
+- **Run Diagnostics**: Split a run's wall-clock into time spent executing and time spent waiting for compute, and name the bottleneck — a run that spent its time queueing has no code problem to tune.
+- **Billing & Usage Analytics**: Generate usage reports (up to 90 days) analyzing total runtime minutes and YCU (Yeedu Compute Unit) consumption per cluster. YCU measures machine shape, not money; `job_cost_report` is the separate tool that estimates cloud spend in currency.
+- **Cloud Cost Estimation**: Convert a run's wall-clock into estimated provider spend at on-demand list price, something the platform itself cannot do because nothing in it knows what an instance-hour costs. Rates are overridable per organisation, and every figure carries its basis region, as-of date and exclusions.
 - **Notebooks**: Create, edit, clone, and run notebooks; start and manage kernels, execute ad-hoc code or selected cells, and read run logs.
 - **Tenant & Access Administration**: Manage tenants and workspaces, browse the user/group directory, assign platform and tenant roles, and grant or revoke workspace access.
 - **Infrastructure Configuration**: Manage cloud environments, credential, network, volume and boot-disk configurations, cluster configurations, and cluster mounts.
@@ -83,6 +86,8 @@ Two further guardrails cover the administrative tools:
 5. **Credential Handoff**: No secret value crosses the tool interface in either direction. The operations that would carry one — `manage_secret` create/rotate, `manage_git_credential` create/rotate, `manage_token` create — do not perform the action. They return the exact CLI command and the UI screen for the user to run that one step themselves, and the agent continues by id afterwards. Everything that does not carry a value (listing, renaming, re-describing, deleting, referencing by id) stays in the server.
 
 6. **Confirmation Gate**: Every destructive operation takes a `confirm` parameter and refuses to act without it. Called without it the tool performs nothing: it reads the record back and returns what would be lost, plus the exact line to retry. The agent is instructed never to set `confirm` on a first call and never to self-confirm — the flag means a human has seen that specific record and said yes.
+
+7. **Blast Radius**: For the lifecycle operations the named thing is not the thing lost — stopping a cluster kills every run on it, and a cluster is routinely shared by several workspaces. Those refusals therefore measure the surroundings rather than echoing the target: runs in flight, workspaces attached, how long a run has been executing. A cluster named rather than addressed by id is resolved first, and a name matching more than one cluster refuses outright instead of picking one. The previews are best-effort: a preview that fails still produces a refusal, because an unreadable platform must not turn a refusal into an error an agent retries past.
 
 ---
 
@@ -129,7 +134,9 @@ Environment variables configure the server via `pydantic-settings`:
 | `YEEDU_MCP_SERVER_URL` | optional | `http://127.0.0.1:8000/mcp` | Server URL when running in `streamable-http` mode |
 | `VERIFY_SSL` | optional | `false` | Enable strict TLS certificate verification |
 | `YEEDU_SSL_CERT_PATH` | optional | — | Custom CA bundle file path for self-signed certificates |
+| `YEEDU_MCP_PRICE_TABLE` | optional | — | Path to a JSON file of cloud rates, replacing or extending the seeded on-demand list prices used by `job_cost_report`. Set it to report the rates your organisation actually pays, or to price on-prem clusters, which have no public rate. |
 | `LOG_LEVEL` | optional | `INFO` | Output logging verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+| `LOG_FORMAT` | optional | see `logging_setup.py` | `logging` format string for the log file |
 | `LOG_DIR` | optional | `~/.yeedu-mcp/logs` | Directory for the rotating log file (`yeedu-mcp-server.log`) |
 | `LOG_MAX_BYTES` | optional | `5242880` (5 MB) | Size at which the log file rotates |
 | `LOG_BACKUP_COUNT` | optional | `3` | Rotated files kept; total disk use is capped at about 20 MB |
@@ -306,12 +313,13 @@ The server listens on `http://127.0.0.1:8000/mcp` (see `YEEDU_MCP_SERVER_URL`). 
 
 ## Available Tools
 
-The server exposes **96 tools**. Read operations are plain tools; write operations are grouped into `manage_*` tools that take an `action` parameter, so one tool covers the create / list / get / edit / delete surface of a resource.
+The server exposes **101 tools**. Read operations are plain tools; write operations are grouped into `manage_*` tools that take an `action` parameter, so one tool covers the create / list / get / edit / delete surface of a resource.
 
 Two conventions apply throughout:
 
 - Any `action` that destroys or disables something takes `confirm=True`. Without it the tool performs nothing and returns the record it would have changed.
 - No tool accepts or returns a secret value. The operations that would carry one return the CLI command and UI screen for the user to run that step themselves.
+- An empty result is reported as a result, not as an error. The platform's listing endpoints answer "nothing matched" with HTTP 404, so asking which clusters are stuck or which runs failed used to return an error that rendered a healthy fleet and an unreachable API identically. Those listings now report zero rows together with the filters they applied. A 404 that means the thing you *filtered by* does not exist — a missing cluster config, say — is still an error, because answering "nothing matched" there would be a false all-clear.
 
 ### 1. Identity, Directory & Access
 | Tool | Description |
@@ -344,7 +352,7 @@ Two conventions apply throughout:
 | `get_cluster_details` | Full configuration: machine specs, cloud environment, network, Spark version, autoscaling, audit fields. |
 | `create_cluster` | Creates a cluster instance from a cluster configuration and cloud environment. |
 | `update_cluster` | Changes name, idle timeout, worker counts, or labels. |
-| `cluster_action` | Lifecycle: `start`, `stop`, `destroy`, `disable`, `enable`, `stop_all_jobs`. |
+| `cluster_action` | Lifecycle: `start`, `stop`, `destroy`, `disable`, `enable`, `stop_all_jobs`. The four destructive actions are gated and first report what the action would take down — runs in flight and every workspace attached to the cluster. |
 | `get_cluster_events` | Status-change history, with the status IDs the log and error tools need. |
 | `get_cluster_node_events` | Node-level utilization and addressing events. |
 | `get_cluster_logs` | STDOUT or STDERR for a cluster node status event. |
@@ -382,6 +390,8 @@ These build the stack a cluster needs, bottom up: a credential configuration, th
 | `get_job_run_details` | Run status, runtime configuration, and status transitions. |
 | `get_job_run_logs` | STDOUT or STDERR for a run. |
 | `get_job_errors` | Workflow engine errors for a failed run. |
+| `diagnose_run` | Splits a run's wall-clock into execution and waiting time and names the bottleneck. |
+| `job_cost_report` | Estimates what a run, or a job's recent runs, cost the cloud account, in currency. |
 | `analyze_job_issue` | Diagnostic checklist for a failed or degraded job. |
 
 ### 6. Notebooks
@@ -427,6 +437,9 @@ These build the stack a cluster needs, bottom up: a credential configuration, th
 | `manage_catalog_secret_link` | Links a catalog to the secrets used to reach it, at `user`, `workspace` or `tenant` scope. |
 | `browse_catalog` | Browses catalogs, schemas, tables, functions, or volumes. |
 | `get_table_details` | Column schema or raw `CREATE TABLE` DDL. |
+| `run_sql` | Executes SQL on a cluster over Thrift and returns rows, naming the catalog the query resolved against. |
+| `find_sql_clusters` | Finds the running clusters that can serve a SQL query, so a query does not have to start by guessing a cluster. |
+| `find_metastore_for_object` | Finds which metastore catalog holds a named table or schema. |
 
 ### 9. Object Storage, Secrets & Billing
 | Tool | Description |
