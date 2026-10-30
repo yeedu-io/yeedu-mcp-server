@@ -20,6 +20,7 @@ from yeedu_mcp_server.tools.access import (
 from yeedu_mcp_server.tools.metastore import _linked_secret, _link_table
 from yeedu_mcp_server.tools.secrets import _csv_cell, _token_table
 from yeedu_mcp_server.tools.workspace import _candidate_rows
+from yeedu_mcp_server.utils.run_metrics import _normalise
 
 
 def _cells(row):
@@ -251,3 +252,52 @@ def test_candidate_rows_accepts_both_listing_shapes():
     assert _candidate_rows([row]) == [row]
     assert _candidate_rows({"result_set": {"total_pages": 0}}) == []
     assert _candidate_rows(None) == []
+
+
+# ---------------------------------------------------------------------------
+# 7. A run's timing sits at the top level but its identity does not: the job
+#    and the cluster are nested under job_conf, and the single-run endpoint
+#    names the job `name` where the listing names it `job_name`. Reading the
+#    top level alone yields a run with no cluster, which does not raise -- it
+#    silently makes the run uncostable and reports its job as N/A.
+# ---------------------------------------------------------------------------
+def test_normalise_reads_identity_from_job_conf():
+    row = {
+        "run_id": 1810365,
+        "run_status": "DONE",
+        "total_run_time_sec": 15.68,
+        "execution_time_sec": 15.28,
+        "approx_ycu": 0.01,
+        "job_conf": {
+            "job_id": 1801746,
+            "name": "mcp-runsql-probe",
+            "spark_job_type": {"job_type": "SPARK_SQL", "language": "SQL"},
+            "cluster_info": {
+                "cluster_id": 357, "name": "onprem-s", "cluster_status": "RUNNING",
+            },
+        },
+    }
+    run = _normalise(row)
+    assert run["job_id"] == 1801746
+    assert run["job_name"] == "mcp-runsql-probe"
+    assert run["cluster_id"] == 357
+    assert run["cluster_name"] == "onprem-s"
+    assert (run["total_sec"], run["execution_sec"]) == (15.68, 15.28)
+    assert run["status"] == "DONE"
+
+
+def test_normalise_reads_the_listing_spelling_of_the_job_name():
+    run = _normalise({"run_id": 1, "job_conf": {"job_name": "nightly-load"}})
+    assert run["job_name"] == "nightly-load"
+
+
+def test_normalise_falls_back_to_the_notebook_identity():
+    run = _normalise({"job_conf": {"notebook_id": 42, "notebook_name": "explore"}},
+                     fallback_run_id=7)
+    assert (run["run_id"], run["job_id"], run["job_name"]) == (7, 42, "explore")
+
+
+def test_normalise_survives_a_run_with_no_job_conf():
+    run = _normalise({"run_id": 9})
+    assert run["cluster_id"] is None and run["job_id"] is None
+    assert run["status"] == "UNKNOWN"

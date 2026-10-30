@@ -33,8 +33,18 @@ Execute the hint instruction before retrying. Do NOT retry with the same paramet
 that caused the error.
 
 ## Compute Cost Units
-Express ALL compute costs in YCU (Yeedu Compute Units). Never use currency symbols
-($, €, £) or monetary amounts. If asked "how much does this cost?", respond in YCU only.
+Platform usage is measured in YCU (Yeedu Compute Units) and is expressed in YCU only.
+Never convert YCU into a currency and never attach a monetary figure to it: YCU is a
+function of machine shape (vCPUs/4 + memory_GB/10), so it states how large a machine
+was, not what anyone was charged for it.
+
+Cloud infrastructure spend is a separate quantity and is reported in currency, but
+only as returned by `job_cost_report` — never from your own arithmetic. Relay that
+tool's figures together with the caveats it returns (on-demand list price, basis
+region, as-of date, excludes storage, egress and committed-use discounts). A bare
+currency figure with the caveats stripped off is a misrepresentation, not a summary.
+If asked "how much does this cost?" and no cost tool has been called, call
+`job_cost_report` rather than estimating.
 
 ## Cluster State Prerequisite
 Before submitting a Spark job run, verify the target cluster status is RUNNING.
