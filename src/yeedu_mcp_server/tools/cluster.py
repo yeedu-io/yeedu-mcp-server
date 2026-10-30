@@ -12,6 +12,22 @@ from yeedu_mcp_server.utils.blast_radius import (
     cluster_impact,
 )
 from yeedu_mcp_server.utils.confirm import confirmation_required, confirmed
+from yeedu_mcp_server.utils.listing import (
+    is_empty_listing,
+    no_rows,
+    validate_enum,
+)
+
+#: The statuses the API's own enum accepts. RESIZING_UP and RESIZING_DOWN were
+#: advertised by two tool descriptions here but are rejected by the API with a
+#: 400 that fails the whole request: a cluster being resized reports RUNNING.
+CLUSTER_STATUSES = frozenset({
+    "INITIATING", "RUNNING", "STOPPING", "STOPPED", "DESTROYING",
+    "DESTROYED", "ERROR",
+})
+
+_NO_RESIZING = "A cluster being resized reports RUNNING; there is no RESIZING status."
+
 
 
 @mcp.tool(
@@ -24,7 +40,10 @@ async def list_clusters(
     ),
     cluster_status: Optional[List[str]] = Field(
         default=None,
-        description="Filter by cluster statuses: INITIATING, RUNNING, STOPPING, STOPPED, DESTROYING, DESTROYED, ERROR, RESIZING_UP, RESIZING_DOWN",
+        description=(
+            "Filter by cluster statuses: INITIATING, RUNNING, STOPPING, "
+            "STOPPED, DESTROYING, DESTROYED, ERROR"
+        ),
     ),
     cluster_conf_id: Optional[int] = Field(
         default=None, description="Filter by cluster config ID"
@@ -46,7 +65,11 @@ async def list_clusters(
         params = {}
 
         if cluster_status:
-            params["cluster_status"] = cluster_status
+            invalid = validate_enum(
+                cluster_status, CLUSTER_STATUSES, "cluster status", _NO_RESIZING)
+            if invalid:
+                return invalid
+            params["cluster_status"] = [str(v).upper() for v in cluster_status]
 
         if cluster_conf_id is not None:
             params["cluster_conf_id"] = cluster_conf_id
@@ -147,6 +170,13 @@ async def list_clusters(
             return table
 
     except Exception as e:
+        if is_empty_listing(e):
+            # An empty listing is an answer, not a fault. Reported as an error,
+            # a healthy fleet reads the same as an unreachable API.
+            return no_rows(
+                "clusters", params,
+                hint="Nothing is in the states asked about. To widen the "
+                     "search, drop cluster_status or pass enable=None.")
         return f"Error listing clusters: {str(e)}. HINT: If listing fails due to parameters, verify your filters."
 
 
@@ -596,7 +626,11 @@ async def get_workspace_clusters(
     workspace_id: int = Field(description="Workspace ID to filter clusters"),
     cluster_status: Optional[List[str]] = Field(
         default=None,
-        description="List of cluster statuses to filter, can be the following values: INITIATING, RUNNING, STOPPING, STOPPED, DESTROYING, DESTROYED, ERROR, RESIZING UP, RESIZING DOWN."
+        description=(
+            "List of cluster statuses to filter, can be the following values: "
+            "INITIATING, RUNNING, STOPPING, STOPPED, DESTROYING, DESTROYED, "
+            "ERROR."
+        )
     ),
     job_type: Optional[str] = Field(
         default=None,
@@ -618,7 +652,11 @@ async def get_workspace_clusters(
     try:
         params = {}
         if cluster_status:
-            params["cluster_status"] = cluster_status
+            invalid = validate_enum(
+                cluster_status, CLUSTER_STATUSES, "cluster status", _NO_RESIZING)
+            if invalid:
+                return invalid
+            params["cluster_status"] = [str(v).upper() for v in cluster_status]
         if job_type:
             params["job_type"] = job_type
         if enable is not None:
@@ -705,6 +743,11 @@ async def get_workspace_clusters(
             return table
 
     except Exception as e:
+        if is_empty_listing(e):
+            return no_rows(
+                f"clusters attached to workspace {workspace_id}", params,
+                hint="Either no cluster is granted access to this workspace, "
+                     "or none is in the states asked about.")
         return f"Error getting workspace clusters: {str(e)}. HINT: Double check if workspace_id is correct. Use list_workspaces to check."
 
 

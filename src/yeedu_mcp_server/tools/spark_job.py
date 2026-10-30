@@ -7,6 +7,7 @@ from pydantic import Field
 from yeedu_mcp_server.client import YeeduClient
 from yeedu_mcp_server.utils.formatting import serialize_table
 from yeedu_mcp_server.mcp_server import mcp
+from yeedu_mcp_server.utils.listing import is_empty_listing, no_rows
 from yeedu_mcp_server.utils.blast_radius import (
     TERMINAL_RUN_STATUSES,
     job_run_blast_radius,
@@ -174,6 +175,14 @@ async def workspace_job_runs(
             return table
 
     except Exception as e:
+        if is_empty_listing(e):
+            # "No runs are in ERROR" is the answer an on-call wants and the
+            # answer the API gives, but it arrives as a 404. Reported as an
+            # error, a clean workspace is indistinguishable from a broken one.
+            return no_rows(
+                f"job runs in workspace {workspace_id}", params,
+                hint="To widen the search, drop run_status, or call "
+                     "get_workspace_stats for the counts per status.")
         return f"Error listing job runs: {str(e)}. HINT: Double-check the workspace_id and any filter arrays (e.g. cluster_ids, job_ids)."
 
 
