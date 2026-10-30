@@ -266,3 +266,29 @@ def test_a_failed_run_still_says_where_its_time_went():
 
 def test_a_run_with_no_timing_pair_says_so_instead_of_guessing():
     assert "no usable timing pair" in _verdict(None, None)
+
+
+def test_a_stopped_run_is_not_reported_as_a_failure():
+    # STOPPED means a person ended the run, or a notebook session was shut
+    # down. Calling it a failure sends the reader looking for a stack trace
+    # that was never written -- seen against a notebook run stopped after 18
+    # minutes of healthy execution.
+    verdict = _verdict(1089.69, 1089.29, status="STOPPED")
+    assert "was stopped" in verdict
+    assert "Run ended STOPPED" not in verdict
+
+
+def test_a_stopped_run_is_not_sent_looking_for_a_stack_trace():
+    run = {"status": "STOPPED", "run_id": 1810356, "cluster_id": 357,
+           "total_sec": 1089.69, "execution_sec": 1089.29}
+    nxt = diagnose(run, breakdown(run))["next"]
+    assert "stack trace" not in nxt
+    assert "analyze_job_issue" not in nxt
+    assert "not evidence of a defect" in nxt
+
+
+def test_a_genuine_failure_still_points_at_the_diagnosis_tools():
+    run = {"status": "ERROR", "run_id": 5, "cluster_id": 357,
+           "total_sec": 600.0, "execution_sec": 590.0}
+    nxt = diagnose(run, breakdown(run))["next"]
+    assert "analyze_job_issue" in nxt and "stack trace" in nxt

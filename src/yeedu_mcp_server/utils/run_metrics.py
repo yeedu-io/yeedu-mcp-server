@@ -29,7 +29,11 @@ _WAIT_DOMINANT_PCT = 50.0
 _WAIT_NOTABLE_PCT = 25.0
 _WAIT_FLOOR_SEC = 30.0
 
-_FAILED_STATUSES = {"ERROR", "TERMINATED", "STOPPED", "KILLED"}
+#: STOPPED is deliberately not a failure: it means a person ended the run,
+#: or a notebook session was shut down. Treating it as one sends the reader
+#: looking for a stack trace that was never written.
+_FAILED_STATUSES = {"ERROR", "TERMINATED", "KILLED"}
+_STOPPED_STATUSES = {"STOPPED"}
 _PENDING_STATUSES = {"SUBMITTED", "RUNNING", "STOPPING"}
 
 
@@ -207,6 +211,19 @@ def diagnose(run: Dict[str, Any], split: Dict[str, Any]) -> Dict[str, str]:
                         "run, so computing and waiting cannot be separated."),
             "next": (f"get_job_run_logs(run_id={run['run_id']}) has the "
                      f"wall-clock the driver itself recorded."),
+        }
+
+    if status in _STOPPED_STATUSES:
+        return {
+            "verdict": (f"Run was stopped after {split['total_sec']:.1f}s rather "
+                        f"than failing or finishing, so these timings cover only "
+                        f"the part that ran: {split['execution_sec']:.1f}s "
+                        f"executing, {wait:.1f}s waiting."),
+            "next": ("A stopped run is not evidence of a defect -- someone ended "
+                     "it, or a notebook session was shut down, so there is no "
+                     "failure to classify. If it was expected to finish, "
+                     f"get_job_run_logs(run_id={run['run_id']}) shows how far it "
+                     f"got."),
         }
 
     if status in _FAILED_STATUSES:
