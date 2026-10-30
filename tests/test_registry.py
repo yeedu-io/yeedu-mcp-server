@@ -121,8 +121,29 @@ def test_the_destructive_actions_are_gated(by_name):
     for name in ("manage_token", "manage_workspace", "manage_tenant",
                  "manage_secret", "manage_role_assignment",
                  "manage_workspace_access", "manage_cluster_mount",
-                 "manage_cloud_env", "manage_metastore_catalog"):
+                 "manage_cloud_env", "manage_metastore_catalog",
+                 # The lifecycle operations: these take down running work
+                 # rather than deleting a record, and were the last four the
+                 # gate did not cover.
+                 "cluster_action", "stop_job_run", "stop_notebook_run",
+                 "notebook_kernel_action"):
         assert "confirm" in _params(by_name[name]), name
+
+
+def test_a_tool_annotated_destructive_is_gated(tools):
+    # The annotation is a promise to the client, which may render it as a
+    # warning. A tool that advertises itself as destructive and then acts on
+    # the first call makes that warning the only thing standing between a
+    # mistake and a destroyed cluster.
+    ungated = [
+        t.name for t in tools
+        if getattr(t.annotations, "destructiveHint", None)
+        and "confirm" not in _params(t)
+    ]
+    assert ungated == []
+    # The converse is deliberately not asserted: the manage_* tools multiplex
+    # reads and writes through one `action`, so annotating them destructive
+    # wholesale would mark a listing as dangerous.
 
 
 def test_system_prompt_states_both_policies():

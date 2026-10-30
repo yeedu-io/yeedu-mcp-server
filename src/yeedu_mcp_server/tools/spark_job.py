@@ -7,6 +7,11 @@ from pydantic import Field
 from yeedu_mcp_server.client import YeeduClient
 from yeedu_mcp_server.utils.formatting import serialize_table
 from yeedu_mcp_server.mcp_server import mcp
+from yeedu_mcp_server.utils.blast_radius import (
+    TERMINAL_RUN_STATUSES,
+    job_run_blast_radius,
+)
+from yeedu_mcp_server.utils.confirm import confirmation_required, confirmed
 from yeedu_mcp_server.utils.job_type_utils import (
     display_job_type,
     display_job_lang,
@@ -1229,16 +1234,52 @@ async def get_job_run_details(
 
 
 @mcp.tool(
-    description="Stops a RUNNING or SUBMITTED Spark job run by run_id. Returns CSV: run_id, action, status.",
+    description=(
+        "Stops a RUNNING or SUBMITTED Spark job run by run_id. Requires "
+        "confirm=True: called without it, the tool stops nothing and returns the "
+        "run, the job it belongs to and how long it has been executing, so the "
+        "user can confirm it is the right run before its work is discarded. "
+        "Returns CSV: run_id, action, status."
+    ),
     annotations={"destructiveHint": True}
 )
 async def stop_job_run(
     workspace_id: int = Field(
         description="Workspace ID containing the job run"),
     run_id: int = Field(description="Run ID of the job to stop"),
+    confirm: bool = Field(
+        default=False,
+        description=(
+            "Must be True to stop the run. Set it only after the user has seen "
+            "this specific run."
+        ),
+    ),
 ) -> str:
     """Stop a running job. Job must be in RUNNING or SUBMITTED state."""
     try:
+        if not confirmed(confirm):
+            record, status = await job_run_blast_radius(workspace_id, run_id)
+            if status and status.upper() in TERMINAL_RUN_STATUSES:
+                # Nothing to stop is a better answer than a confirmation
+                # prompt for a no-op.
+                return (f"Run {run_id} is already {status}, so there is nothing "
+                        f"to stop.")
+            return confirmation_required(
+                "Spark job run",
+                f"run_id={run_id}",
+                "stop_job_run",
+                action="stop",
+                record=record,
+                impact=(
+                    "The run is killed mid-execution. Its partial output is not "
+                    "kept and it cannot be resumed -- recovering means submitting "
+                    "a new run from the start. The cluster keeps running and other "
+                    "runs on it are unaffected."
+                ),
+                retry=f"workspace_id={workspace_id}, run_id={run_id}",
+                include_action=False,
+            )
+
         async with YeeduClient() as client:
             data = await client.post(
                 f"/api/v1/workspace/{workspace_id}/spark/job/run/stop/{run_id}"

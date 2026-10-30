@@ -15,6 +15,11 @@ from yeedu_mcp_server.client import YeeduClient
 from yeedu_mcp_server.config import SSL_VERIFY_YEEDU, YEEDU_API_BASE_URL
 from yeedu_mcp_server.utils.formatting import serialize_table
 from yeedu_mcp_server.mcp_server import mcp
+from yeedu_mcp_server.utils.blast_radius import (
+    TERMINAL_RUN_STATUSES,
+    notebook_run_blast_radius,
+)
+from yeedu_mcp_server.utils.confirm import confirmation_required, confirmed
 
 
 def _ident(notebook_id: Optional[int], notebook_name: Optional[str]) -> dict:
@@ -331,14 +336,50 @@ async def get_notebook_run(
 
 
 @mcp.tool(
-    description="Stops (kills) a running notebook run by run_id (not notebook_id). This ends the notebook session and its kernel; unsaved cell state is lost."
+    description=(
+        "Stops (kills) a running notebook run by run_id (not notebook_id). This "
+        "ends the notebook session and its kernel; unsaved cell state is lost. "
+        "Requires confirm=True: called without it, the tool stops nothing and "
+        "returns the run and the notebook it belongs to, so the user can confirm "
+        "it is the right session before its in-memory state is discarded."
+    ),
+    annotations={"destructiveHint": True}
 )
 async def stop_notebook_run(
     workspace_id: int = Field(description="Workspace ID containing the notebook run"),
     run_id: int = Field(description="Notebook run ID to stop"),
+    confirm: bool = Field(
+        default=False,
+        description=(
+            "Must be True to stop the run. Set it only after the user has seen "
+            "this specific notebook run."
+        ),
+    ),
 ) -> str:
     """Stop a notebook run"""
     try:
+        if not confirmed(confirm):
+            record, status = await notebook_run_blast_radius(workspace_id, run_id)
+            if status and status in TERMINAL_RUN_STATUSES:
+                return (f"Notebook run {run_id} is already {status}, so there is "
+                        f"nothing to stop.")
+            return confirmation_required(
+                "Notebook run",
+                f"run_id={run_id}",
+                "stop_notebook_run",
+                action="stop",
+                record=record,
+                impact=(
+                    "This ends the notebook session and kills its kernel. Every "
+                    "variable and DataFrame held in memory is lost, along with any "
+                    "cell output not already saved, and a cell executing now is "
+                    "cut off. The notebook file itself is untouched and can be run "
+                    "again."
+                ),
+                retry=f"workspace_id={workspace_id}, run_id={run_id}",
+                include_action=False,
+            )
+
         async with YeeduClient() as client:
             data = await client.post(
                 f"/api/v1/workspace/{workspace_id}/notebook/run/kill/{run_id}")
@@ -396,18 +437,65 @@ async def get_notebook_kernel_status(
 
 
 @mcp.tool(
-    description="Interrupts or restarts the kernel of a notebook run by run_id (not notebook_id). action must be 'interrupt' (stop the currently executing cell) or 'restart' (restart the kernel; in-memory variables are lost)."
+    description=(
+        "Interrupts or restarts the kernel of a notebook run by run_id (not "
+        "notebook_id). action must be 'interrupt' (stop the currently executing "
+        "cell) or 'restart' (restart the kernel; in-memory variables are lost). "
+        "restart requires confirm=True and returns the run for review when called "
+        "without it; interrupt is not gated, because stopping one cell is the "
+        "ordinary way to recover a stuck notebook and keeps all session state."
+    )
 )
 async def notebook_kernel_action(
     workspace_id: int = Field(description="Workspace ID containing the notebook run"),
     run_id: int = Field(description="Notebook run ID"),
     action: str = Field(description="Action: interrupt or restart"),
+    confirm: bool = Field(
+        default=False,
+        description=(
+            "Must be True for action='restart'. Set it only after the user has "
+            "seen this specific notebook run. Not needed for interrupt."
+        ),
+    ),
 ) -> str:
     """Interrupt or restart a notebook kernel"""
     try:
         action = action.lower()
         if action not in ("interrupt", "restart"):
             return f"Error: Invalid action '{action}'. Must be: interrupt, restart."
+
+        # Only restart is gated. Interrupt stops the running cell and leaves
+        # every variable in place, so requiring confirmation for it would add
+        # friction to the standard remedy for a wedged notebook.
+        if action == "restart" and not confirmed(confirm):
+            record, status = await notebook_run_blast_radius(workspace_id, run_id)
+            # A run that is over has no kernel. Asking someone to approve the
+            # loss of session state that ended when the run did invites them to
+            # confirm a call whose only outcome is an error.
+            if status and status in TERMINAL_RUN_STATUSES:
+                return (
+                    f"Notebook run {run_id} is already {status}, so there is no "
+                    f"live kernel to restart and no session state left to lose."
+                    + (f"\n\n{record}" if record else "")
+                    + "\n\nTo work in this notebook again, start a new run "
+                      "with start_notebook."
+                )
+            return confirmation_required(
+                "Notebook kernel for",
+                f"run_id={run_id}",
+                "notebook_kernel_action",
+                action="restart",
+                record=record,
+                impact=(
+                    "Restarting discards every variable, DataFrame and cached "
+                    "result held in the kernel, so the notebook has to be re-run "
+                    "from the top to get back to its current state. Saved cell "
+                    "output and the notebook file are untouched. To stop a single "
+                    "stuck cell without losing session state, use "
+                    "action='interrupt' instead."
+                ),
+                retry=f"workspace_id={workspace_id}, run_id={run_id}",
+            )
         async with YeeduClient() as client:
             data = await client.post(
                 f"/api/v1/workspace/{workspace_id}/notebook/run/{run_id}/kernel/{action}")

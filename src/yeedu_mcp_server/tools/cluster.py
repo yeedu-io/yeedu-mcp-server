@@ -6,6 +6,12 @@ from yeedu_mcp_server.client import YeeduClient
 from yeedu_mcp_server.utils.formatting import serialize_table
 from yeedu_mcp_server.mcp_server import mcp
 from yeedu_mcp_server.utils.job_type_utils import display_job_type
+from yeedu_mcp_server.utils.blast_radius import (
+    AmbiguousTarget,
+    cluster_blast_radius,
+    cluster_impact,
+)
+from yeedu_mcp_server.utils.confirm import confirmation_required, confirmed
 
 
 @mcp.tool(
@@ -1116,8 +1122,22 @@ async def get_cluster_prerequisites(
 
 
 
+#: Lifecycle actions that destroy work or availability. start and enable add
+#: capacity and are not gated.
+_GATED_CLUSTER_ACTIONS = ("stop", "destroy", "disable", "stop_all_jobs")
+
+
 @mcp.tool(
-    description="Performs a lifecycle action on a cluster instance: start, stop, destroy, disable, enable, or stop_all_jobs. stop_all_jobs requires cluster_id. disable/enable use PUT, all others POST. Requires cluster_id or cluster_name. Returns CSV: action, cluster_id, cluster_name, status/message.",
+    description=(
+        "Performs a lifecycle action on a cluster instance: start, stop, destroy, "
+        "disable, enable, or stop_all_jobs. stop_all_jobs requires cluster_id. "
+        "disable/enable use PUT, all others POST. Requires cluster_id or cluster_name. "
+        "stop, destroy, disable and stop_all_jobs require confirm=True: called "
+        "without it, the tool performs nothing and returns the cluster, how many "
+        "runs are in flight on it, and which workspaces point at it, so the user "
+        "can see what the action would take down before approving it. Returns CSV: "
+        "action, cluster_id, cluster_name, status/message."
+    ),
     annotations={"destructiveHint": True}
 )
 async def cluster_action(
@@ -1129,6 +1149,13 @@ async def cluster_action(
     ),
     cluster_name: Optional[str] = Field(
         default=None, description="Cluster instance name (used if ID not provided)"
+    ),
+    confirm: bool = Field(
+        default=False,
+        description=(
+            "Must be True for stop, destroy, disable and stop_all_jobs. Set it only "
+            "after the user has seen this specific cluster and what is running on it."
+        ),
     ),
 ) -> str:
     """Perform lifecycle actions on a cluster: start, stop, destroy, disable, enable, or stop all jobs."""
@@ -1144,6 +1171,37 @@ async def cluster_action(
         # stop_all_jobs only accepts cluster_id (path param, no body)
         if action == "stop_all_jobs" and cluster_id is None:
             return "Error: cluster_id is required for stop_all_jobs action."
+
+        # The gate comes before any write. What is being named is not what is
+        # being lost -- a cluster's name says nothing about the runs a stop
+        # kills -- so the refusal measures the surroundings and reports them.
+        if action in _GATED_CLUSTER_ACTIONS and not confirmed(confirm):
+            try:
+                resolved, record, facts = await cluster_blast_radius(
+                    cluster_id, cluster_name)
+            except AmbiguousTarget as exc:
+                return f"Error: {exc}"
+            except Exception:
+                # An unreadable platform must not downgrade a refusal into an
+                # error, which an agent would simply retry past.
+                resolved, record, facts = cluster_id, None, {
+                    "active_runs": None, "workspaces": []}
+
+            target = (f"cluster_id={resolved}" if resolved is not None
+                      else f"cluster_name={cluster_name!r}")
+            retry = (f"cluster_id={resolved}" if resolved is not None
+                     else f"cluster_name='{cluster_name}'")
+            return confirmation_required(
+                "Cluster",
+                target,
+                "cluster_action",
+                action=action,
+                record=record,
+                impact=cluster_impact(action, facts),
+                retry=retry,
+                action_label=("stop all jobs on" if action == "stop_all_jobs"
+                              else action),
+            )
 
         async with YeeduClient() as client:
             payload = {}

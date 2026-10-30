@@ -18,6 +18,23 @@ from typing import Any, Optional
 #: The only values that count as confirmation.
 _TRUE = {"true", "yes", "y", "1", "on"}
 
+#: Verbs whose past tense is not formed by appending "d" or "ed". Appending
+#: blindly produces "stoped" and "stop_all_jobsed", which reads as a bug in the
+#: refusal and undermines the one message that has to be taken seriously.
+_IRREGULAR_PAST = {
+    "stop": "stopped",
+    "stop_all_jobs": "stopped",
+    "kill": "killed",
+    "reset": "reset",
+    "run": "run",
+}
+
+
+def _past_tense(action: str) -> str:
+    if action in _IRREGULAR_PAST:
+        return _IRREGULAR_PAST[action]
+    return action + ("d" if action.endswith("e") else "ed")
+
 
 def confirmed(value: Any) -> bool:
     """Whether a confirm flag really says yes.
@@ -47,6 +64,7 @@ def confirmation_required(
     impact: Optional[str] = None,
     retry: Optional[str] = None,
     include_action: bool = True,
+    action_label: Optional[str] = None,
 ) -> str:
     """Return the message that stands in for performing a destructive action.
 
@@ -62,13 +80,17 @@ def confirmation_required(
             `manage_*` tools do, so their retry line needs it. Tools that name
             their verb in the tool name itself do not, and printing one there
             would hand back a call signature that does not exist.
+        action_label: How to say the verb in the sentence, when the API's own
+            value does not read as English. `stop_all_jobs` has to stay the
+            value in the retry line, but the sentence should say "stop all jobs
+            on". Defaults to `action`.
     """
-    # "delete" → "deleted", "unassign" → "unassigned".
-    past = action + ("d" if action.endswith("e") else "ed")
+    # "delete" → "deleted", "unassign" → "unassigned", "stop" → "stopped".
+    past = _past_tense(action)
     lines = [
         f"Not {past} — confirmation required.",
         "",
-        f"This would {action} {label.lower()} {target}.",
+        f"This would {action_label or action} {label.lower()} {target}.",
     ]
 
     if record:
