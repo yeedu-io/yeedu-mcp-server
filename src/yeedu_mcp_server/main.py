@@ -33,14 +33,20 @@ from yeedu_mcp_server.mcp_server import mcp
 # Import tool & prompt modules — each registers decorators at import time
 import yeedu_mcp_server.tools.billing  # noqa: F401
 import yeedu_mcp_server.tools.cluster       # noqa: F401
+import yeedu_mcp_server.tools.infra         # noqa: F401
 import yeedu_mcp_server.tools.workspace     # noqa: F401
+import yeedu_mcp_server.tools.access        # noqa: F401
 import yeedu_mcp_server.tools.spark_job     # noqa: F401
+import yeedu_mcp_server.tools.notebook     # noqa: F401
 import yeedu_mcp_server.tools.metastore     # noqa: F401
 import yeedu_mcp_server.tools.git           # noqa: F401
 import yeedu_mcp_server.tools.storage       # noqa: F401
 import yeedu_mcp_server.tools.secrets       # noqa: F401
 import yeedu_mcp_server.tools.tenants       # noqa: F401
 import yeedu_mcp_server.tools.reference     # noqa: F401
+import yeedu_mcp_server.tools.sql           # noqa: F401
+import yeedu_mcp_server.tools.sql_discovery  # noqa: F401
+import yeedu_mcp_server.tools.run_metrics   # noqa: F401
 import yeedu_mcp_server.prompts             # noqa: F401
 
 

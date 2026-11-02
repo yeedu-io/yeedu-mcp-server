@@ -7,7 +7,15 @@ Provides capabilities to list object storage manager configurations and manage f
 from typing import Optional
 from pydantic import Field
 from yeedu_mcp_server.client import YeeduClient
+from yeedu_mcp_server.utils.confirm import confirmation_required, confirmed
+from yeedu_mcp_server.utils.params import opt
 from yeedu_mcp_server.mcp_server import mcp
+
+# The OSM registration is a configuration resource shaped exactly like the ones
+# in tools/infra.py, so it is declared in that module's _RESOURCES table and
+# driven by the same _crud. The tool itself lives here, next to the file
+# operations it feeds, rather than duplicating ninety lines of CRUD.
+from yeedu_mcp_server.tools.infra import _body, _crud
 
 
 @mcp.tool(
@@ -70,9 +78,13 @@ async def list_storage_managers(
         return f"Error listing storage managers: {str(e)}. HINT: Ensure your API connection is valid and cloud_provider filter value is correct."
 
 
-@mcp.tool(description="Manages files in an object storage manager. action=list returns CSV: file_id, file_name, file_path, file_size, is_directory with pagination. action=download returns the raw file content (up to 5000 chars). action=delete removes a file and returns CSV: action, file_id, status. Requires osm_id or osm_name; file_id or file_path is required for download/delete.")
+@mcp.tool(description="Manages files in an object storage manager. action=list returns CSV: file_id, file_name, file_path, file_size, is_directory with pagination. action=download returns the raw file content (up to 5000 chars). action=delete removes a file and returns CSV: action, file_id, status. Requires osm_id or osm_name; file_id or file_path is required for download/delete. action='delete' requires confirm=True: the first call returns the file it would delete and does nothing, so ask the user before repeating the call with confirm=True.")
 async def manage_osm_files(
     action: str = Field(description="Action: list, download, or delete"),
+    confirm: bool = Field(
+        default=False,
+        description="Must be True for action='delete'. Set it only after the user has confirmed this specific file.",
+    ),
     osm_id: Optional[int] = Field(
         default=None, description="Object storage manager ID"),
     osm_name: Optional[str] = Field(
@@ -99,6 +111,27 @@ async def manage_osm_files(
 
         if action in ("download", "delete") and file_id is None and file_path is None:
             return f"Error: file_id or file_path is required for {action} action. HINT: Call manage_osm_files with action='list' first to view files."
+
+        # Refuse before opening a connection, so an unreachable API cannot turn
+        # a refusal into an error the agent retries its way past.
+        if action == "delete" and not confirmed(confirm):
+            target = (
+                f"file_id={file_id}" if file_id is not None else f"'{file_path}'"
+            )
+            osm = f"osm_id={osm_id}" if osm_id is not None else f"osm_name='{osm_name}'"
+            retry = (
+                f"{osm}, "
+                + (f"file_id={file_id}" if file_id is not None
+                   else f"file_path='{file_path}'")
+            )
+            return confirmation_required(
+                "Object storage file",
+                target,
+                "manage_osm_files",
+                record=f"Storage manager: {osm}",
+                impact="The object is deleted from the storage bucket and cannot be recovered through Yeedu.",
+                retry=retry,
+            )
 
         async with YeeduClient() as client:
             # Common params
@@ -254,3 +287,159 @@ async def manage_osm_files(
         return f"Error managing OSM files: {str(e)}. HINT: Double-check action (list, download, delete), file_id, file_path, and your credentials."
 
 
+
+@mcp.tool(
+    description=(
+        "Manages object storage manager (OSM) registrations — the bucket definitions "
+        "that manage_osm_files then operates inside. "
+        "action='list' lists them (optionally filtered by cloud_provider_id); "
+        "action='search' finds them by name; action='get' reads one back; "
+        "action='create' registers a bucket and needs name, cloud_provider_id, "
+        "credentials_conf_id and bucket_name; action='edit' changes name, description "
+        "or credentials_conf_id on an existing one; action='delete' removes the "
+        "registration. Lookup ids come from list_compute_lookups (cloud providers) and "
+        "manage_credential_config(action='list') (credential configurations) — the "
+        "credential must grant access to that bucket, which for OnPrem means a "
+        "'Custom S3a Credentials' credential, not Proxmox basic auth. "
+        "Deleting does not touch the bucket's contents, only this platform's handle on "
+        "it. action='delete' requires confirm=True: the first call returns the "
+        "registration it would remove and does nothing, so ask the user before "
+        "repeating the call with confirm=True."
+    )
+)
+async def manage_storage_manager(
+    action: str = Field(
+        description="list, search, get, create, edit, or delete"),
+    osm_id: Optional[int] = Field(
+        default=None,
+        description="Object storage manager id, for get, edit and delete",
+    ),
+    osm_name: Optional[str] = Field(
+        default=None,
+        description=(
+            "Object storage manager name — the identifier for get/edit/delete when "
+            "no id is known, the term for search, and the new name on create"
+        ),
+    ),
+    description: Optional[str] = Field(
+        default=None, description="Free-text description, for create and edit"),
+    cloud_provider_id: Optional[int] = Field(
+        default=None,
+        description=(
+            "Cloud provider id, required on create and usable as a list filter; "
+            "ids come from list_compute_lookups"
+        ),
+    ),
+    credentials_conf_id: Optional[int] = Field(
+        default=None,
+        description=(
+            "Credential configuration id granting access to the bucket, required on "
+            "create and changeable on edit; ids come from "
+            "manage_credential_config(action='list')"
+        ),
+    ),
+    bucket_name: Optional[str] = Field(
+        default=None,
+        description="Name of the bucket in the cloud provider, required on create",
+    ),
+    limit: int = Field(default=20, ge=1, le=100, description="Items per page"),
+    page: int = Field(default=1, ge=1, description="Page number"),
+    confirm: bool = Field(
+        default=False,
+        description="Must be True to actually delete. Leave unset on the first call.",
+    ),
+) -> str:
+    """Create, read, update or delete an object storage manager registration."""
+    action = (action or "").strip().lower()
+    allowed = ("list", "search", "get", "create", "edit", "delete")
+    if action not in allowed:
+        return (
+            f"Error: unknown action '{action}'. "
+            f"Hint: use one of {', '.join(allowed)}."
+        )
+
+    osm_id = opt(osm_id)
+    osm_name = opt(osm_name)
+    description = opt(description)
+    cloud_provider_id = opt(cloud_provider_id)
+    credentials_conf_id = opt(credentials_conf_id)
+    bucket_name = opt(bucket_name)
+
+    if action == "create":
+        missing = [
+            label for label, value in (
+                ("osm_name", osm_name),
+                ("cloud_provider_id", cloud_provider_id),
+                ("credentials_conf_id", credentials_conf_id),
+                ("bucket_name", bucket_name),
+            ) if value is None
+        ]
+        if missing:
+            return (
+                f"Error: action='create' needs {', '.join(missing)}. "
+                "Hint: list_compute_lookups has the cloud provider ids and "
+                "manage_credential_config(action='list') the credential ids."
+            )
+
+    if action == "edit" and not any(
+        v is not None for v in (osm_name, description, credentials_conf_id)
+    ):
+        return (
+            "Error: action='edit' needs at least one of osm_name, description or "
+            "credentials_conf_id to change. Hint: the bucket and cloud provider are "
+            "fixed once registered — create a new registration to point at another "
+            "bucket."
+        )
+
+    try:
+        if action == "create":
+            body = _body(
+                name=osm_name,
+                description=description,
+                cloud_provider_id=cloud_provider_id,
+                credentials_conf_id=credentials_conf_id,
+                object_storage_bucket_name=bucket_name,
+            )
+            # The new name is the payload, not a selector, so it must not also
+            # be sent as one.
+            return await _crud(
+                "object_storage_manager", action, body=body)
+
+        if action == "edit":
+            # On an edit the name is ambiguous: it is both how the record is
+            # found and what it may be renamed to. An id resolves it; without
+            # one the name can only be the selector, so it cannot also be the
+            # new value.
+            if osm_id is None:
+                if description is None and credentials_conf_id is None:
+                    return (
+                        "Error: renaming needs osm_id, because osm_name is how the "
+                        "record is found. Hint: look up the id with "
+                        "manage_storage_manager(action='search', osm_name=...)."
+                    )
+                body = _body(description=description,
+                             credentials_conf_id=credentials_conf_id)
+                return await _crud(
+                    "object_storage_manager", action,
+                    selector_name=osm_name, body=body)
+            body = _body(name=osm_name, description=description,
+                         credentials_conf_id=credentials_conf_id)
+            return await _crud(
+                "object_storage_manager", action,
+                selector_id=osm_id, body=body)
+
+        return await _crud(
+            "object_storage_manager", action,
+            selector_id=osm_id,
+            selector_name=osm_name,
+            filters={"cloud_provider_id": cloud_provider_id},
+            page=page,
+            limit=limit,
+            confirm=confirm,
+        )
+    except Exception as e:
+        return (
+            f"Error managing object storage manager: {e}. "
+            "HINT: Confirm the osm_id or osm_name with "
+            "manage_storage_manager(action='list')."
+        )

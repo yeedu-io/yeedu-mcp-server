@@ -243,8 +243,16 @@ class YeeduClient:
                 try:
                     error_data = response.json()
                     if isinstance(error_data, dict):
-                        error_detail = error_data.get(
-                            "error", error_data.get("error_message", str(error_data))
+                        error_detail = (
+                            # The API answers validation failures with
+                            # "message" (plus a per-field "errors" array).
+                            # Omitting that key reported those errors as a
+                            # stringified dict, burying the one sentence that
+                            # says what to fix.
+                            error_data.get("error")
+                            or error_data.get("error_message")
+                            or error_data.get("message")
+                            or str(error_data)
                         )
                     else:
                         error_detail = str(error_data)
@@ -303,8 +311,16 @@ class YeeduClient:
                 try:
                     error_data = response.json()
                     if isinstance(error_data, dict):
-                        error_detail = error_data.get(
-                            "error_message", error_data.get("error", str(error_data))
+                        error_detail = (
+                            # The API answers validation failures with
+                            # "message" (plus a per-field "errors" array).
+                            # Omitting that key reported those errors as a
+                            # stringified dict, burying the one sentence that
+                            # says what to fix.
+                            error_data.get("error")
+                            or error_data.get("error_message")
+                            or error_data.get("message")
+                            or str(error_data)
                         )
                 except Exception:
                     pass

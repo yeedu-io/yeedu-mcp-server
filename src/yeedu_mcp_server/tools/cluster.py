@@ -6,6 +6,28 @@ from yeedu_mcp_server.client import YeeduClient
 from yeedu_mcp_server.utils.formatting import serialize_table
 from yeedu_mcp_server.mcp_server import mcp
 from yeedu_mcp_server.utils.job_type_utils import display_job_type
+from yeedu_mcp_server.utils.blast_radius import (
+    AmbiguousTarget,
+    cluster_blast_radius,
+    cluster_impact,
+)
+from yeedu_mcp_server.utils.confirm import confirmation_required, confirmed
+from yeedu_mcp_server.utils.listing import (
+    is_empty_listing,
+    no_rows,
+    validate_enum,
+)
+
+#: The statuses the API's own enum accepts. RESIZING_UP and RESIZING_DOWN were
+#: advertised by two tool descriptions here but are rejected by the API with a
+#: 400 that fails the whole request: a cluster being resized reports RUNNING.
+CLUSTER_STATUSES = frozenset({
+    "INITIATING", "RUNNING", "STOPPING", "STOPPED", "DESTROYING",
+    "DESTROYED", "ERROR",
+})
+
+_NO_RESIZING = "A cluster being resized reports RUNNING; there is no RESIZING status."
+
 
 
 @mcp.tool(
@@ -18,7 +40,10 @@ async def list_clusters(
     ),
     cluster_status: Optional[List[str]] = Field(
         default=None,
-        description="Filter by cluster statuses: INITIATING, RUNNING, STOPPING, STOPPED, DESTROYING, DESTROYED, ERROR, RESIZING_UP, RESIZING_DOWN",
+        description=(
+            "Filter by cluster statuses: INITIATING, RUNNING, STOPPING, "
+            "STOPPED, DESTROYING, DESTROYED, ERROR"
+        ),
     ),
     cluster_conf_id: Optional[int] = Field(
         default=None, description="Filter by cluster config ID"
@@ -40,7 +65,11 @@ async def list_clusters(
         params = {}
 
         if cluster_status:
-            params["cluster_status"] = cluster_status
+            invalid = validate_enum(
+                cluster_status, CLUSTER_STATUSES, "cluster status", _NO_RESIZING)
+            if invalid:
+                return invalid
+            params["cluster_status"] = [str(v).upper() for v in cluster_status]
 
         if cluster_conf_id is not None:
             params["cluster_conf_id"] = cluster_conf_id
@@ -141,6 +170,13 @@ async def list_clusters(
             return table
 
     except Exception as e:
+        if is_empty_listing(e):
+            # An empty listing is an answer, not a fault. Reported as an error,
+            # a healthy fleet reads the same as an unreachable API.
+            return no_rows(
+                "clusters", params,
+                hint="Nothing is in the states asked about. To widen the "
+                     "search, drop cluster_status or pass enable=None.")
         return f"Error listing clusters: {str(e)}. HINT: If listing fails due to parameters, verify your filters."
 
 
@@ -590,7 +626,11 @@ async def get_workspace_clusters(
     workspace_id: int = Field(description="Workspace ID to filter clusters"),
     cluster_status: Optional[List[str]] = Field(
         default=None,
-        description="List of cluster statuses to filter, can be the following values: INITIATING, RUNNING, STOPPING, STOPPED, DESTROYING, DESTROYED, ERROR, RESIZING UP, RESIZING DOWN."
+        description=(
+            "List of cluster statuses to filter, can be the following values: "
+            "INITIATING, RUNNING, STOPPING, STOPPED, DESTROYING, DESTROYED, "
+            "ERROR."
+        )
     ),
     job_type: Optional[str] = Field(
         default=None,
@@ -612,7 +652,11 @@ async def get_workspace_clusters(
     try:
         params = {}
         if cluster_status:
-            params["cluster_status"] = cluster_status
+            invalid = validate_enum(
+                cluster_status, CLUSTER_STATUSES, "cluster status", _NO_RESIZING)
+            if invalid:
+                return invalid
+            params["cluster_status"] = [str(v).upper() for v in cluster_status]
         if job_type:
             params["job_type"] = job_type
         if enable is not None:
@@ -699,6 +743,11 @@ async def get_workspace_clusters(
             return table
 
     except Exception as e:
+        if is_empty_listing(e):
+            return no_rows(
+                f"clusters attached to workspace {workspace_id}", params,
+                hint="Either no cluster is granted access to this workspace, "
+                     "or none is in the states asked about.")
         return f"Error getting workspace clusters: {str(e)}. HINT: Double check if workspace_id is correct. Use list_workspaces to check."
 
 
@@ -1116,8 +1165,22 @@ async def get_cluster_prerequisites(
 
 
 
+#: Lifecycle actions that destroy work or availability. start and enable add
+#: capacity and are not gated.
+_GATED_CLUSTER_ACTIONS = ("stop", "destroy", "disable", "stop_all_jobs")
+
+
 @mcp.tool(
-    description="Performs a lifecycle action on a cluster instance: start, stop, destroy, disable, enable, or stop_all_jobs. stop_all_jobs requires cluster_id. disable/enable use PUT, all others POST. Requires cluster_id or cluster_name. Returns CSV: action, cluster_id, cluster_name, status/message.",
+    description=(
+        "Performs a lifecycle action on a cluster instance: start, stop, destroy, "
+        "disable, enable, or stop_all_jobs. stop_all_jobs requires cluster_id. "
+        "disable/enable use PUT, all others POST. Requires cluster_id or cluster_name. "
+        "stop, destroy, disable and stop_all_jobs require confirm=True: called "
+        "without it, the tool performs nothing and returns the cluster, how many "
+        "runs are in flight on it, and which workspaces point at it, so the user "
+        "can see what the action would take down before approving it. Returns CSV: "
+        "action, cluster_id, cluster_name, status/message."
+    ),
     annotations={"destructiveHint": True}
 )
 async def cluster_action(
@@ -1129,6 +1192,13 @@ async def cluster_action(
     ),
     cluster_name: Optional[str] = Field(
         default=None, description="Cluster instance name (used if ID not provided)"
+    ),
+    confirm: bool = Field(
+        default=False,
+        description=(
+            "Must be True for stop, destroy, disable and stop_all_jobs. Set it only "
+            "after the user has seen this specific cluster and what is running on it."
+        ),
     ),
 ) -> str:
     """Perform lifecycle actions on a cluster: start, stop, destroy, disable, enable, or stop all jobs."""
@@ -1144,6 +1214,37 @@ async def cluster_action(
         # stop_all_jobs only accepts cluster_id (path param, no body)
         if action == "stop_all_jobs" and cluster_id is None:
             return "Error: cluster_id is required for stop_all_jobs action."
+
+        # The gate comes before any write. What is being named is not what is
+        # being lost -- a cluster's name says nothing about the runs a stop
+        # kills -- so the refusal measures the surroundings and reports them.
+        if action in _GATED_CLUSTER_ACTIONS and not confirmed(confirm):
+            try:
+                resolved, record, facts = await cluster_blast_radius(
+                    cluster_id, cluster_name)
+            except AmbiguousTarget as exc:
+                return f"Error: {exc}"
+            except Exception:
+                # An unreadable platform must not downgrade a refusal into an
+                # error, which an agent would simply retry past.
+                resolved, record, facts = cluster_id, None, {
+                    "active_runs": None, "workspaces": []}
+
+            target = (f"cluster_id={resolved}" if resolved is not None
+                      else f"cluster_name={cluster_name!r}")
+            retry = (f"cluster_id={resolved}" if resolved is not None
+                     else f"cluster_name='{cluster_name}'")
+            return confirmation_required(
+                "Cluster",
+                target,
+                "cluster_action",
+                action=action,
+                record=record,
+                impact=cluster_impact(action, facts),
+                retry=retry,
+                action_label=("stop all jobs on" if action == "stop_all_jobs"
+                              else action),
+            )
 
         async with YeeduClient() as client:
             payload = {}
@@ -1424,3 +1525,54 @@ async def update_cluster(
     except Exception as e:
         return f"Error updating cluster: {str(e)}. HINT: Check if the cluster is in the correct state (DESTROYED/ERROR) to update configuration fields like labels, cloud config, spark version, storage, mounts. Fields like name, description, idle_timeout_ms can be updated in any state."
 
+
+
+@mcp.tool(
+    description=(
+        "Calculates how much Spark driver memory the platform will allocate per "
+        "job on a machine of a given size, given how many Spark jobs are allowed "
+        "to run on one instance at a time. Call this while sizing a cluster "
+        "configuration: the platform divides a node's memory across the "
+        "concurrent drivers it permits, so raising "
+        "max_parallel_spark_job_execution_per_instance shrinks every driver, and "
+        "a combination that leaves too little per driver is rejected. "
+        "machine_memory is the node's total memory in GB. Returns the platform's "
+        "own answer in words."
+    ),
+    annotations={"readOnlyHint": True},
+)
+async def calculate_spark_driver_memory(
+    machine_memory: int = Field(
+        ge=1, description="Total memory of one machine, in GB"),
+    max_parallel_spark_job_execution_per_instance: int = Field(
+        ge=1,
+        description="How many Spark jobs may run concurrently on one instance"),
+) -> str:
+    """Ask the platform what driver memory a machine shape yields per job."""
+    try:
+        async with YeeduClient() as client:
+            data = await client.get(
+                "/api/v1/cluster/spark_driver_memory",
+                params={
+                    "machine_memory": machine_memory,
+                    "max_parallel_spark_job_execution_per_instance":
+                        max_parallel_spark_job_execution_per_instance,
+                })
+        record = data[0] if isinstance(data, list) and data else data
+        if isinstance(record, dict):
+            message = record.get("message") or record.get("error_message")
+            if message:
+                return str(message)
+        return json.dumps(record, indent=2, default=str)
+    except Exception as e:
+        # The endpoint answers an unworkable combination with HTTP 400 and
+        # "The calculated Spark driver memory is below the minimum requirement
+        # of 1G for each job" rather than a number, and that refusal is the
+        # answer: too little memory per driver for the concurrency asked for.
+        return (
+            f"Error calculating Spark driver memory: {str(e)}. HINT: The platform "
+            "rejects a combination that leaves too little memory per driver — "
+            "lower max_parallel_spark_job_execution_per_instance or pick a "
+            "machine with more memory (list_compute_lookups(kind='machine_types') "
+            "has the shapes)."
+        )

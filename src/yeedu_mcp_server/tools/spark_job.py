@@ -1,11 +1,20 @@
 """Spark job definitions, execution control, and log monitoring tools for Yeedu MCP Server."""
 
+import asyncio
 import json
 from typing import List, Optional
 from pydantic import Field
 from yeedu_mcp_server.client import YeeduClient
 from yeedu_mcp_server.utils.formatting import serialize_table
 from yeedu_mcp_server.mcp_server import mcp
+from yeedu_mcp_server.utils.listing import is_empty_listing, no_rows
+from yeedu_mcp_server.utils.params import opt
+from yeedu_mcp_server.utils.export import deliver, fetch_export
+from yeedu_mcp_server.utils.blast_radius import (
+    TERMINAL_RUN_STATUSES,
+    job_run_blast_radius,
+)
+from yeedu_mcp_server.utils.confirm import confirmation_required, confirmed
 from yeedu_mcp_server.utils.job_type_utils import (
     display_job_type,
     display_job_lang,
@@ -168,6 +177,14 @@ async def workspace_job_runs(
             return table
 
     except Exception as e:
+        if is_empty_listing(e):
+            # "No runs are in ERROR" is the answer an on-call wants and the
+            # answer the API gives, but it arrives as a 404. Reported as an
+            # error, a clean workspace is indistinguishable from a broken one.
+            return no_rows(
+                f"job runs in workspace {workspace_id}", params,
+                hint="To widen the search, drop run_status, or call "
+                     "get_workspace_stats for the counts per status.")
         return f"Error listing job runs: {str(e)}. HINT: Double-check the workspace_id and any filter arrays (e.g. cluster_ids, job_ids)."
 
 
@@ -716,7 +733,11 @@ async def create_job(
     principal: Optional[str] = Field(
         default=None, description="Kerberos principal"),
     keytab: Optional[str] = Field(
-        default=None, description="Kerberos keytab file"),
+        default=None,
+        description="Path to the Kerberos keytab file on the cluster, passed "
+                    "through as spark-submit --keytab. This is a path, not the "
+                    "keytab contents; keytab material belongs in a HIVE KERBEROS "
+                    "secret, which this server never carries."),
     queue: Optional[str] = Field(
         default=None, description="YARN queue to submit the job to"),
 
@@ -814,6 +835,178 @@ async def create_job(
 
 
 @mcp.tool(
+    description="Creates a new notebook configuration in a workspace. Required: workspace_id, notebook_name, notebook_type (python3/scala/sql). Optional: cluster_id or cluster_name to attach a cluster, notebook_path (directory inside the workspace files), Spark conf/packages/jars/files, driver/executor resources, max_concurrency, should_append_params. Returns the created notebook details."
+)
+async def create_notebook(
+    workspace_id: int = Field(
+        description="Workspace ID where the notebook will be created"),
+    notebook_name: str = Field(min_length=1, description="Notebook name"),
+    notebook_type: str = Field(
+        description="Notebook type: python3, scala, or sql"),
+    cluster_id: Optional[int] = Field(
+        default=None, description="ID of the cluster to attach to the notebook"),
+    cluster_name: Optional[str] = Field(
+        default=None, description="Name of the cluster to attach (alternative to cluster_id)"),
+    notebook_path: Optional[str] = Field(
+        default=None, description="Path inside the workspace files where the notebook is created, e.g. '/foo/bar'"),
+    max_concurrency: Optional[int] = Field(
+        default=None, ge=0, description="Maximum concurrent notebook runs (default 1)"),
+    conf: Optional[List[str]] = Field(
+        default=None, description="Spark conf key-value pairs"),
+    packages: Optional[List[str]] = Field(
+        default=None, description="List of Spark packages"),
+    jars: Optional[List[str]] = Field(
+        default=None, description="List of jar files"),
+    files: Optional[List[str]] = Field(
+        default=None, description="List of file paths"),
+    driver_memory: Optional[str] = Field(
+        default=None, description="Memory allocated to Spark driver"),
+    executor_memory: Optional[str] = Field(
+        default=None, description="Memory allocated to executors"),
+    driver_cores: Optional[int] = Field(
+        default=None, ge=1, description="Number of cores for driver"),
+    executor_cores: Optional[int] = Field(
+        default=None, ge=1, description="Number of cores per executor"),
+    num_executors: Optional[int] = Field(
+        default=None, ge=1, description="Total number of executors"),
+    total_executor_cores: Optional[int] = Field(
+        default=None, ge=1, description="Total number of executor cores"),
+    should_append_params: Optional[bool] = Field(
+        default=None, description="Append job Spark configuration to the cluster-level configuration instead of overriding it"),
+) -> str:
+    """Create a notebook, optionally attached to a cluster"""
+    try:
+        notebook_type = notebook_type.lower()
+        if notebook_type not in ("python3", "scala", "sql"):
+            return f"Error: Invalid notebook_type '{notebook_type}'. Must be one of: python3, scala, sql."
+
+        body = {
+            "notebook_name": notebook_name,
+            "notebook_type": notebook_type,
+            "cluster_id": cluster_id,
+            "cluster_name": cluster_name,
+            "notebook_path": notebook_path,
+            "max_concurrency": max_concurrency,
+            "conf": conf,
+            "packages": packages,
+            "jars": jars,
+            "files": files,
+            "driver_memory": driver_memory,
+            "executor_memory": executor_memory,
+            "driver_cores": driver_cores,
+            "executor_cores": executor_cores,
+            "num_executors": num_executors,
+            "total_executor_cores": total_executor_cores,
+            "should_append_params": should_append_params,
+        }
+
+        # Filter out None values
+        body = {k: v for k, v in body.items() if v is not None}
+
+        async with YeeduClient() as client:
+            data = await client.post(f"/api/v1/workspace/{workspace_id}/notebook", json=body)
+            return f"Notebook created successfully: {data}"
+
+    except Exception as e:
+        return f"Error creating notebook: {str(e)}. HINT: Ensure the cluster supports notebooks and notebook_name is unique in the workspace."
+
+
+async def _wait_for_run_running(client, workspace_id: int, run_id: int, timeout_sec: int) -> str:
+    """Poll a notebook run until it leaves SUBMITTED. Returns the last run_status seen."""
+    status = "UNKNOWN"
+    for _ in range(max(1, timeout_sec // 5)):
+        run = await client.get(
+            f"/api/v1/workspace/{workspace_id}/notebook/run/{run_id}")
+        run = run if isinstance(run, dict) else {}
+        status = str(run.get("run_status") or "UNKNOWN")
+        if status != "SUBMITTED":
+            return status
+        await asyncio.sleep(5)
+    return status
+
+
+@mcp.tool(
+    description="Starts a notebook run for a notebook configuration (use notebook_id from create_notebook or the job listing) and starts its kernel. The attached cluster must be RUNNING. A new run takes a minute or two to leave SUBMITTED, and the kernel is started once it reaches RUNNING; pass start_kernel=False to skip that wait. Optionally pass runtime_arguments and runtime_conf (Spark conf overrides for this run only). Returns the new run details and kernel status."
+)
+async def start_notebook(
+    workspace_id: int = Field(
+        description="Workspace ID of the workspace where the notebook is present"),
+    notebook_id: int = Field(description="ID of the notebook to start"),
+    start_kernel: bool = Field(
+        default=True, description="Also start the notebook kernel once the run is created"),
+    kernel_wait_sec: int = Field(
+        default=240, ge=0, le=900,
+        description="Seconds to wait for the new run to reach RUNNING before starting its kernel"),
+    runtime_arguments: Optional[str] = Field(
+        default=None, description="Runtime arguments for the notebook"),
+    runtime_conf: Optional[List[str]] = Field(
+        default=None, description="Runtime Spark configurations. example: ['spark.executor.memory=2g']"),
+) -> str:
+    """Start a notebook run (and kernel) - cluster must be RUNNING"""
+    try:
+        json_payload = {"notebook_id": notebook_id}
+        if runtime_arguments:
+            json_payload["arguments"] = runtime_arguments
+        if runtime_conf:
+            json_payload["conf"] = runtime_conf
+
+        async with YeeduClient() as client:
+            run = await client.post(
+                f"/api/v1/workspace/{workspace_id}/notebook/run",
+                json=json_payload
+            )
+            result = f"Notebook run started successfully: {run}"
+
+            run_id = run.get("run_id") if isinstance(run, dict) else None
+            if not (start_kernel and run_id):
+                return result
+
+            # The run is created asynchronously and sits in SUBMITTED until the cluster
+            # allocates its driver; starting the kernel before that is rejected. Everything
+            # below is reported alongside the run details rather than raised, so that a
+            # kernel that is not up yet never hides the run_id the caller needs next.
+            status = await _wait_for_run_running(client, workspace_id, run_id, kernel_wait_sec)
+            if status != "RUNNING":
+                return (f"{result}\nKernel: not started - run {run_id} is in state {status}. "
+                        f"The run exists; poll get_notebook_run with run_id {run_id} and call "
+                        f"start_notebook_kernel once it is RUNNING.")
+            try:
+                kernel = await client.post(
+                    f"/api/v1/workspace/{workspace_id}/notebook/run/{run_id}/kernel/startOrGetStatus"
+                )
+                result += f"\nKernel: {kernel}"
+            except Exception as kernel_error:
+                result += (f"\nKernel: not started ({kernel_error}). The run {run_id} exists; "
+                           f"retry with start_notebook_kernel and run_id {run_id}.")
+            return result
+
+    except Exception as e:
+        return f"Error starting notebook: {str(e)}. HINT: Check if the attached cluster is active and running."
+
+
+@mcp.tool(
+    description="Starts the kernel of an existing notebook run, or returns its status if already started. The notebook run (run_id from start_notebook) must be in RUNNING state. Returns the kernel status."
+)
+async def start_notebook_kernel(
+    workspace_id: int = Field(
+        description="Workspace ID of the workspace where the notebook run is present"),
+    run_id: int = Field(description="Notebook run ID (not the notebook_id)"),
+) -> str:
+    """Start (or get the status of) the kernel for a RUNNING notebook run"""
+    try:
+        async with YeeduClient() as client:
+            data = await client.post(
+                f"/api/v1/workspace/{workspace_id}/notebook/run/{run_id}/kernel/startOrGetStatus"
+            )
+            return f"Notebook kernel status: {data}"
+
+    except Exception as e:
+        return (f"Error starting notebook kernel: {str(e)}. HINT: Check the run with get_notebook_run - "
+                "a run in SUBMITTED is still coming up, so wait and retry with the same run_id; "
+                "a run in STOPPED or ERROR needs a new run from start_notebook.")
+
+
+@mcp.tool(
     description="Updates an existing Spark job configuration by job_id. Only provided fields are changed. Editable fields include: name, cluster_id/cluster_name, Spark resources (driver/executor memory, cores), conf/packages/jars, code/command/arguments, Functions-specific params, timeout, concurrency, should_append_params. Always call edit_job_instructions prompt first. Returns the updated job details.",
     annotations={"idempotentHint": True}
 )
@@ -872,7 +1065,11 @@ async def edit_job(
     principal: Optional[str] = Field(
         default=None, description="Kerberos principal"),
     keytab: Optional[str] = Field(
-        default=None, description="Kerberos keytab file"),
+        default=None,
+        description="Path to the Kerberos keytab file on the cluster, passed "
+                    "through as spark-submit --keytab. This is a path, not the "
+                    "keytab contents; keytab material belongs in a HIVE KERBEROS "
+                    "secret, which this server never carries."),
     queue: Optional[str] = Field(
         default=None, description="YARN queue to submit the job to"),
 
@@ -1048,16 +1245,52 @@ async def get_job_run_details(
 
 
 @mcp.tool(
-    description="Stops a RUNNING or SUBMITTED Spark job run by run_id. Returns CSV: run_id, action, status.",
+    description=(
+        "Stops a RUNNING or SUBMITTED Spark job run by run_id. Requires "
+        "confirm=True: called without it, the tool stops nothing and returns the "
+        "run, the job it belongs to and how long it has been executing, so the "
+        "user can confirm it is the right run before its work is discarded. "
+        "Returns CSV: run_id, action, status."
+    ),
     annotations={"destructiveHint": True}
 )
 async def stop_job_run(
     workspace_id: int = Field(
         description="Workspace ID containing the job run"),
     run_id: int = Field(description="Run ID of the job to stop"),
+    confirm: bool = Field(
+        default=False,
+        description=(
+            "Must be True to stop the run. Set it only after the user has seen "
+            "this specific run."
+        ),
+    ),
 ) -> str:
     """Stop a running job. Job must be in RUNNING or SUBMITTED state."""
     try:
+        if not confirmed(confirm):
+            record, status = await job_run_blast_radius(workspace_id, run_id)
+            if status and status.upper() in TERMINAL_RUN_STATUSES:
+                # Nothing to stop is a better answer than a confirmation
+                # prompt for a no-op.
+                return (f"Run {run_id} is already {status}, so there is nothing "
+                        f"to stop.")
+            return confirmation_required(
+                "Spark job run",
+                f"run_id={run_id}",
+                "stop_job_run",
+                action="stop",
+                record=record,
+                impact=(
+                    "The run is killed mid-execution. Its partial output is not "
+                    "kept and it cannot be resumed -- recovering means submitting "
+                    "a new run from the start. The cluster keeps running and other "
+                    "runs on it are unaffected."
+                ),
+                retry=f"workspace_id={workspace_id}, run_id={run_id}",
+                include_action=False,
+            )
+
         async with YeeduClient() as client:
             data = await client.post(
                 f"/api/v1/workspace/{workspace_id}/spark/job/run/stop/{run_id}"
@@ -1079,3 +1312,374 @@ async def stop_job_run(
     except Exception as e:
         return f"Error stopping job run: {str(e)}. HINT: A job can only be stopped if it is currently RUNNING or SUBMITTED."
 
+
+
+# ---------------------------------------------------------------------------
+# Job definition state, export, and the two lookups that start from a run
+# ---------------------------------------------------------------------------
+
+def _job_ident(job_id: Optional[int], job_name: Optional[str]) -> dict:
+    """The query params that identify a job definition, by either id or name."""
+    params: dict = {}
+    if job_id is not None:
+        params["job_id"] = job_id
+    elif job_name:
+        params["job_name"] = job_name
+    return params
+
+
+@mcp.tool(
+    description=(
+        "Enables or disables a Spark job definition by job_id or job_name. "
+        "action must be 'enable' or 'disable'. Disabling takes the job out of "
+        "active listings and stops it being run; it does not delete it and does "
+        "not touch runs already in flight, and enable puts it back. Yeedu has no "
+        "job DELETE, so disable is the reversible equivalent. Note that a "
+        "disabled job stops appearing in list_job_configurations entirely, so "
+        "record the job_id before disabling: re-enabling needs an id the "
+        "listing will no longer give you."
+    ),
+    annotations={"idempotentHint": True},
+)
+async def set_job_state(
+    workspace_id: int = Field(description="Workspace ID containing the job definition"),
+    action: str = Field(description="Action: enable or disable"),
+    job_id: Optional[int] = Field(
+        default=None, description="Job definition ID (not a run_id)"),
+    job_name: Optional[str] = Field(
+        default=None, description="Job definition name, if job_id is not given"),
+) -> str:
+    """Enable or disable a Spark job definition."""
+    try:
+        action = (action or "").strip().lower()
+        if action not in ("enable", "disable"):
+            return f"Error: Invalid action '{action}'. Must be: enable, disable."
+        if job_id is None and not job_name:
+            return (
+                "Error: Either job_id or job_name is required. Hint: "
+                "list_job_configurations lists the job definitions in a workspace."
+            )
+        async with YeeduClient() as client:
+            data = await client.put(
+                f"/api/v1/workspace/{workspace_id}/spark/job/{action}",
+                params=_job_ident(job_id, job_name))
+        target = job_name or f"job_id {job_id}"
+        return (
+            f"Job {target} {action}d successfully.\n"
+            f"{json.dumps(data, indent=2, default=str)}"
+        )
+    except Exception as e:
+        return (
+            f"Error trying to {action} job: {str(e)}. HINT: Confirm the job "
+            "exists in this workspace with list_job_configurations, and that "
+            "job_id is a job definition id rather than a run_id."
+        )
+
+
+def _app_info_rows(record: dict) -> List[str]:
+    """Render the application-id lookup as field,value rows.
+
+    The run id arrives under the key `job_id`, and it is not a job id: the
+    projection is `'job_id', temp_cte.spark_job_instance_id`, joined from
+    `spark_job_instance.id` (`query/SparkJobInstanceStatusQuery.js`, the
+    `sqlForGetWorkflowJobInstanceDetails` SELECT and the `spark_details` CTE
+    above it). The spec's own example for `WorkflowJobInstanceDetails` calls
+    the field `run_id`; the live response does not carry that key at all.
+
+    Both plausible readings are therefore wrong, in opposite directions.
+    Reading the key as named hands back a run id labelled as a job definition
+    id -- the one substitution ID discipline exists to prevent, and the caller
+    would go on to pass it to a tool expecting a job_id. Reading `run_id`
+    instead drops the only field this lookup exists to produce, and drops it
+    silently, because an absent key renders as a missing row, not an error.
+    """
+    lines = ["field,value"]
+
+    run_id = record.get("job_id", record.get("run_id"))
+    if run_id is not None:
+        lines.append(f"run_id,{run_id}")
+
+    for key in ("application_id", "run_status", "cluster_id",
+                "compute_engine", "last_update_date", "from_date", "to_date"):
+        if key in record:
+            lines.append(f"{key},{record[key]}")
+
+    for who in ("created_by", "modified_by"):
+        value = record.get(who)
+        if isinstance(value, dict):
+            lines.append(f"{who},{value.get('username', 'N/A')}")
+        elif value is not None:
+            lines.append(f"{who},{value}")
+
+    # workflow_job_instance_details carries a sibling block,
+    # workflow_execution_process, holding the executing node's hostname,
+    # machine id, OS user and pid. That is infrastructure detail the server is
+    # not allowed to hand back, and it answers no question the caller asked, so
+    # only the status block is read.
+    details = record.get("workflow_job_instance_details")
+    status = (details or {}).get("workflow_job_instance_status") \
+        if isinstance(details, dict) else None
+    if isinstance(status, dict):
+        # The nested block names one field `workflow_job_instance_id` and the
+        # rest bare, so a blanket prefix yields `workflow_workflow_job_...`.
+        for key in ("workflow_job_instance_id", "status", "from_date", "to_date"):
+            if key in status:
+                label = key if key.startswith("workflow_") else f"workflow_{key}"
+                lines.append(f"{label},{status[key]}")
+        previous = status.get("previous_status")
+        if isinstance(previous, list) and previous:
+            lines.append(f"workflow_status_history,{' -> '.join(map(str, previous))}")
+
+    return lines
+
+
+@mcp.tool(
+    description=(
+        "Finds the Yeedu run that produced a given Spark application_id and "
+        "returns its execution details: run_id, run status with the status "
+        "history it passed through, cluster, timings and who created it. This is "
+        "the reverse of get_job_run_details, for when the starting point is a "
+        "Spark application id taken from the Spark UI, a driver log or a "
+        "downstream system rather than a run_id."
+    ),
+    annotations={"readOnlyHint": True},
+)
+async def find_run_by_application_id(
+    workspace_id: int = Field(description="Workspace ID the run belongs to"),
+    application_id: str = Field(
+        min_length=1,
+        description="Spark application id, e.g. application_1718959721329_0001 or local-1718959721329"),
+) -> str:
+    """Resolve a Spark application_id back to the Yeedu run that produced it."""
+    try:
+        async with YeeduClient() as client:
+            data = await client.get(
+                f"/api/v1/workspace/{workspace_id}/spark/job/run"
+                f"/workflow_job_instance_details/{application_id}")
+
+        record = data[0] if isinstance(data, list) and data else data
+        if not isinstance(record, dict) or not record:
+            return (
+                f"No run found for application_id '{application_id}' in workspace "
+                f"{workspace_id}. The query ran and matched nothing; this is an "
+                "empty result, not a failed call. HINT: application ids are "
+                "per-workspace — confirm the workspace with workspace_job_runs."
+            )
+
+        return "\n".join(_app_info_rows(record))
+
+    except Exception as e:
+        return (
+            f"Error resolving application_id '{application_id}': {str(e)}. HINT: "
+            "Pass the Spark application id exactly as Spark reports it, and "
+            "confirm the workspace with workspace_job_runs."
+        )
+
+
+@mcp.tool(
+    description=(
+        "Exports one Spark job definition as a portable .yeedu document, by "
+        "job_id or job_name. This is the single-job counterpart of "
+        "export_workspace, for moving or version-controlling one definition "
+        "instead of a whole workspace. The document is returned inline unless "
+        "output_path is given, in which case it is written to that file or "
+        "directory on the machine running this server. SPARK_JOB, "
+        "YEEDU_FUNCTIONS and JAR jobs can be exported; a THRIFT_SQL job cannot. "
+        "The export carries no secret values — secrets stay referenced by id."
+    ),
+    annotations={"readOnlyHint": True},
+)
+async def export_job(
+    workspace_id: int = Field(description="Workspace ID containing the job definition"),
+    job_id: Optional[int] = Field(
+        default=None, description="Job definition ID to export (not a run_id)"),
+    job_name: Optional[str] = Field(
+        default=None, description="Job definition name, if job_id is not given"),
+    output_path: Optional[str] = Field(
+        default=None,
+        description=(
+            "Local file or directory to write the export to, e.g. "
+            "/home/user/exports/my_job.yeedu. A directory takes the filename the "
+            "server supplies."
+        ),
+    ),
+) -> str:
+    """Export a single Spark job definition."""
+    job_id, job_name = opt(job_id), opt(job_name)
+    subject = f"job {job_name or job_id} from workspace {workspace_id}"
+    try:
+        if job_id is None and not job_name:
+            return (
+                "Error: Either job_id or job_name is required. Hint: "
+                "list_job_configurations lists the job definitions in a workspace."
+            )
+        content, filename, is_text = await fetch_export(
+            f"/api/v1/workspace/{workspace_id}/spark/job/export",
+            _job_ident(job_id, job_name),
+        )
+        return deliver(
+            content, filename, is_text, opt(output_path),
+            subject=subject,
+            fallback_name=f"{job_name or job_id}.yeedu",
+            inline_hint=(
+                "This is the .yeedu export document. Pass output_path to save it "
+                "to a file instead of returning it here."
+            ),
+        )
+    except OSError as e:
+        return (
+            f"Error writing the export to {output_path}: {str(e)}. HINT: The path "
+            "is on the machine running this server; check the directory exists "
+            "and is writable."
+        )
+    except Exception as e:
+        return (
+            f"Error exporting {subject}: {str(e)}. HINT: Confirm the job exists in "
+            "this workspace with list_job_configurations, that job_id is a job "
+            "definition id rather than a run_id, and that the job is not a "
+            "THRIFT_SQL job — those cannot be exported."
+        )
+
+
+#: The function settings worth reporting next to the endpoint: these are what
+#: a caller has to respect when they start sending requests at it.
+_FUNCTION_FIELDS = (
+    "yeedu_functions_function_name",
+    "yeedu_functions_script_path",
+    "yeedu_functions_project_path",
+    "yeedu_functions_requirements",
+    "yeedu_functions_max_request_concurrency",
+    "yeedu_functions_request_timeout_sec",
+    "yeedu_functions_idle_timeout_sec",
+)
+
+
+def _function_path(record: dict, workspace_id: int,
+                   job_id: Optional[int]) -> str:
+    """Build the proxy's POST path for a Functions job.
+
+    The route reads /{tenant_id}/{workspace_id}/{job_id}, and all three
+    segments are numeric ids despite the proxy's own parameter names: it looks
+    the request up in Redis under f"{tenant_id}.{workspace_id}.{job_id}", and
+    that hash is populated by get_all_job_configs, which keys it on
+    w.tenant_id, sj.workspace_id and sj.id (`services/
+    yeedu_functions_service.py` in Yeedu-Functions-Proxy). The abstract
+    `get_job_config(tenant_id, workspace_name, job_name)` alongside it, and the
+    local test harness that keys the same hash on names, both describe a
+    different call -- a path built from names gets "Job configuration not
+    found".
+    """
+    tenant = record.get("tenant_id") or "<tenant-id>"
+    resolved_job_id = record.get("job_id") or job_id or "<job-id>"
+    return f"/{tenant}/{workspace_id}/{resolved_job_id}"
+
+
+@mcp.tool(
+    description=(
+        "Reports how to call a deployed Yeedu Functions job over HTTP: the POST "
+        "path built from tenant id, workspace id and job id, the example "
+        "request body stored on the job, and the concurrency and timeout limits "
+        "a caller has to respect. The path is returned without a host — the "
+        "Functions proxy is a separate deployment this server does not know the "
+        "address of, so prefix it with your own proxy base URL. The function's "
+        "authorization token is NOT returned: the platform generates it and this "
+        "server does not hand credentials back, so read it from the job's screen "
+        "in the UI. Identify the job by job_id or job_name."
+    ),
+    annotations={"readOnlyHint": True},
+)
+async def get_function_endpoint(
+    workspace_id: int = Field(description="Workspace ID containing the Functions job"),
+    job_id: Optional[int] = Field(
+        default=None,
+        description="Job definition ID of the Functions job (not a run_id)"),
+    job_name: Optional[str] = Field(
+        default=None, description="Job definition name, if job_id is not given"),
+) -> str:
+    """Report the HTTP call shape of a Yeedu Functions job."""
+    try:
+        if job_id is None and not job_name:
+            return (
+                "Error: Either job_id or job_name is required. Hint: "
+                "list_job_configurations(job_type=['Functions']) lists the "
+                "Functions jobs in a workspace."
+            )
+
+        async with YeeduClient() as client:
+            data = await client.get(
+                f"/api/v1/workspace/{workspace_id}/spark/job",
+                params=_job_ident(job_id, job_name))
+            record = data[0] if isinstance(data, list) and data else data
+            if not isinstance(record, dict) or not record:
+                return (
+                    f"No job found for {job_name or f'job_id {job_id}'} in "
+                    f"workspace {workspace_id}. HINT: Confirm it with "
+                    "list_job_configurations."
+                )
+
+        job_type = record.get("job_type")
+        if isinstance(job_type, dict):
+            job_type = job_type.get("name")
+        name = record.get("job_name") or job_name or f"job_id {job_id}"
+
+        if job_type and str(job_type).upper() != "YEEDU_FUNCTIONS":
+            return (
+                f"Error: '{name}' is a {display_job_type(str(job_type))} job, "
+                "not a Functions job, so it has no HTTP endpoint. Hint: only a "
+                "Functions job is exposed over HTTP — run a Spark job with "
+                "run_job instead."
+            )
+
+        path = _function_path(record, workspace_id, job_id)
+
+        lines = [
+            f"Yeedu Functions endpoint for '{name}'",
+            "",
+            f"POST {path}",
+            "",
+            "Prefix that path with your Yeedu Functions proxy base URL. The proxy "
+            "is deployed separately from the API this server talks to, so its "
+            "address is not something the server can report.",
+            "",
+            "Caller needs at least RUN permission on the workspace.",
+            "",
+            "The proxy also accepts a fourth path segment naming the endpoint "
+            f"({path}/<endpoint_name>); it defaults to the job conf name when "
+            "left off.",
+        ]
+
+        settings_rows = [(k, record.get(k)) for k in _FUNCTION_FIELDS
+                         if record.get(k) is not None]
+        if settings_rows:
+            lines += ["", "Function settings:", "field,value"]
+            lines += [f"{k},{v}" for k, v in settings_rows]
+
+        body = record.get("yeedu_functions_example_request_body")
+        if body:
+            rendered = body if isinstance(body, str) else json.dumps(
+                body, indent=2, default=str)
+            lines += ["", "Example request body stored on the job:", rendered]
+        else:
+            lines += [
+                "",
+                "No example request body is stored on this job. Its shape is "
+                "whatever the Python function signature accepts — read the script "
+                "with get_workspace_file.",
+            ]
+
+        lines += [
+            "",
+            "Authorization: the function's token is generated by the platform and "
+            "is not returned by this server, which never hands credentials back "
+            "through a tool. Read it from the job's screen in the Yeedu UI "
+            "(Workspaces -> this workspace -> Jobs -> this job) and send it "
+            "yourself.",
+        ]
+        return "\n".join(lines)
+
+    except Exception as e:
+        return (
+            f"Error reading the Functions endpoint: {str(e)}. HINT: Confirm the "
+            "job exists in this workspace with "
+            "list_job_configurations(job_type=['Functions'])."
+        )

@@ -2,10 +2,13 @@
 
 
 import json
+import re
 from typing import List, Optional, Union
 from pydantic import Field
 from yeedu_mcp_server.client import YeeduClient
 from yeedu_mcp_server.mcp_server import mcp
+from yeedu_mcp_server.utils.params import opt
+from yeedu_mcp_server.utils.listing import is_empty_listing
 
 
 def _parse_file_paths(fp: Optional[Union[List[str], str]]) -> Optional[List[str]]:
@@ -38,39 +41,108 @@ def _parse_file_paths(fp: Optional[Union[List[str], str]]) -> Optional[List[str]
     return None
 
 
+#: The providers `express-openapi-validator` accepts for a clone, from the
+#: `CloneGitRepoToWorkspace` enum. It is shorter than the list the platform
+#: supports credentials for, and a value outside it fails the whole request.
+_GIT_PROVIDERS = {
+    "GitHub",
+    "BitBucket Cloud",
+    "GitLab",
+    "Azure DevOps Services",
+}
+
+
+def _workspace_path(path: str) -> str:
+    """Normalise a workspace path to what the clone endpoint accepts.
+
+    `browse_workspace_files` reports paths as `file:///files/...`, and the
+    backend strips exactly that prefix before requiring what is left to be
+    absolute (`resolvePath` in `utils/Workspace.js`). The workspace root is
+    therefore the one path that cannot be given the way it is displayed:
+    `file:///files` strips to the empty string, which is not absolute, so the
+    platform answers "The specified path,  is invalid" with the path blank --
+    an error that names nothing for the caller to correct.
+    """
+    path = (path or "").strip()
+    for prefix in ("file:///files", "/files"):
+        if path == prefix:
+            return "/"
+        if path.startswith(prefix + "/"):
+            return path[len(prefix):]
+    return path or "/"
+
+
 @mcp.tool(
-    description="Clones a Git repository (HTTPS URL) into a workspace folder. Optionally specify git_provider, branch, folder name, and parent location (file_id or file_path). Private repos use the user's stored Git credential for the provider. Returns CSV: workspace_id, git_url, branch, and any additional fields from the API response.",
+    description=(
+        "Clones a Git repository (HTTPS or HTTP URL) into a workspace folder. "
+        "git_url, git_provider and git_branch are all required by the platform. "
+        "git_provider must be one of GitHub, BitBucket Cloud, GitLab or "
+        "Azure DevOps Services. Give the parent location as file_id or "
+        "file_path, not both; the workspace root is '/'. Private repos use the "
+        "user's stored Git credential for that provider — add one with "
+        "manage_git_credential if the clone is rejected for authentication. "
+        "The clone runs in the background: this returns the new folder's "
+        "workspace_file_id, which git_clone_status then polls: job_status goes "
+        "INITIATED -> CLONE_STARTED -> COMPLETED, or FAILED."
+    ),
     annotations={"idempotentHint": True}
 )
 async def git_clone_repo(
     workspace_id: int = Field(description="Workspace ID to clone into"),
-    git_url: str = Field(description="Git repository URL (HTTPS) to clone"),
-    git_provider: Optional[str] = Field(
-        default=None,
-        description="Git provider name (e.g., GitHub, BitBucket Cloud, GitLab, Azure DevOps Services, GitHub Enterprise Server, BitBucket Server, GitLab Enterprise Edition, AWS CodeCommit)",
-    ),
-    git_branch: Optional[str] = Field(
-        default=None, description="Branch to clone"),
+    git_url: str = Field(description="Git repository URL (HTTPS or HTTP) to clone"),
+    git_provider: str = Field(
+        description="Git provider: GitHub, BitBucket Cloud, GitLab or Azure DevOps Services"),
+    git_branch: str = Field(
+        description="Branch to clone, e.g. main or master. The platform has no "
+                    "default and rejects the request if this is missing"),
     git_folder_name: Optional[str] = Field(
         default=None, description="Folder name for cloned repo (defaults to repo name)"),
     file_id: Optional[int] = Field(
         default=None, description="Parent folder file ID where repo will be cloned"),
     file_path: Optional[str] = Field(
-        default=None, description="Parent folder path where repo will be cloned"),
+        default=None,
+        description="Parent folder path where the repo will be cloned, as "
+                    "browse_workspace_files reports it. The workspace root is '/'. "
+                    "Give this or file_id, not both"),
 ) -> str:
-    """Clone a Git repository into the workspace. Requires git_url (HTTPS)."""
+    """Clone a Git repository into the workspace."""
     try:
+        git_provider, git_branch = opt(git_provider), opt(git_branch)
+        file_path = opt(file_path)
+
+        if git_provider not in _GIT_PROVIDERS:
+            return (
+                f"Error: git_provider {git_provider!r} is not one of "
+                f"{', '.join(sorted(_GIT_PROVIDERS))}. HINT: the platform "
+                "validates this against a fixed list and rejects the whole "
+                "request otherwise; list_git_credentials shows the providers "
+                "this user already has a credential for."
+            )
+        if not git_branch:
+            return (
+                "Error: git_branch is required. HINT: the platform has no "
+                "default branch for a clone and rejects the request without "
+                "one — pass the branch you want, e.g. 'main' or 'master'."
+            )
+        if file_id is not None and file_path:
+            return (
+                "Error: give file_id or file_path, not both. HINT: the platform "
+                "rejects a request carrying both."
+            )
+
         params = {"workspace_id": workspace_id}
         if file_id is not None:
             params["file_id"] = file_id
-        if file_path:
-            params["file_path"] = file_path
+        elif file_path:
+            params["file_path"] = _workspace_path(file_path)
+        else:
+            params["file_path"] = "/"
 
-        payload = {"git_url": git_url}
-        if git_provider:
-            payload["git_provider"] = git_provider
-        if git_branch:
-            payload["git_branch"] = git_branch
+        payload = {
+            "git_url": git_url,
+            "git_provider": git_provider,
+            "git_branch": git_branch,
+        }
         if git_folder_name:
             payload["git_folder_name"] = git_folder_name
 
@@ -89,7 +161,7 @@ async def git_clone_repo(
             lines.append(f"git_url,{git_url}")
             if git_provider:
                 lines.append(f"git_provider,{git_provider}")
-            lines.append(f"branch,{git_branch or 'default'}")
+            lines.append(f"branch,{git_branch}")
             if isinstance(data, dict):
                 for k, v in data.items():
                     if k not in ("workspace_id", "git_url", "git_provider") and v is not None:
@@ -491,3 +563,203 @@ async def git_sync(
         return f"Error git {action}: {str(e)}. HINT: Check for local modifications, conflicts, or network issues."
 
 
+
+
+# ---------------------------------------------------------------------------
+# Reading an asynchronous clone back
+#
+# git_clone_repo submits the clone and returns immediately, so its success
+# response only means the request was accepted. A clone that then fails leaves
+# an empty or half-populated GIT_FOLDER behind, and every later call against
+# that folder -- branches, status, diff -- fails for a reason that has nothing
+# to do with the call being made. These three reads are the only way to tell
+# the two apart.
+# ---------------------------------------------------------------------------
+
+_CLONE_ACTIONS = ("status", "log", "errors")
+
+
+def _clone_target(
+    workspace_id: Optional[int],
+    workspace_name: Optional[str],
+    file_id: Optional[int],
+    file_path: Optional[str],
+) -> dict:
+    """The query params that identify a Git folder, by either id or name/path."""
+    params: dict = {}
+    if workspace_id is not None:
+        params["workspace_id"] = workspace_id
+    elif workspace_name:
+        params["workspace_name"] = workspace_name
+    if file_id is not None:
+        params["file_id"] = file_id
+    elif file_path:
+        params["file_path"] = file_path
+    return params
+
+
+#: The server-side mount the clone runs against:
+#: `${YEEDU_SYSTEM_NFS_LOCAL_MOUNT_DIR}/yeedu/files/<tenant uuid>/<workspace id>`
+#: (`cloneGitRepoToWorkspace` in `services/GitService.js`). git writes that
+#: absolute path into its own progress output, so the clone log hands back the
+#: mount point and the tenant uuid unless they are rewritten.
+_MOUNT_PATH = re.compile(
+    r"\S*/yeedu/files/[0-9a-fA-F-]{36}/\d+(?=[/'\"\s]|$)")
+
+
+def _scrub_log(text: str) -> str:
+    """Rewrite host filesystem paths in a clone log as workspace paths.
+
+    The log is git's own output, so it is worth returning verbatim apart from
+    this: a failed clone explains itself there and nowhere else. But it opens
+    with `Cloning into '/nfs/yeedu/files/<tenant>/<workspace>/<folder>'...`,
+    which is the mount layout and the tenant id -- infrastructure detail
+    SYSTEM_PROMPT forbids handing back, and of no use to a caller who
+    addresses the same folder as `file:///files/<folder>`.
+    """
+    return _MOUNT_PATH.sub("file:///files", text or "")
+
+
+@mcp.tool(
+    description=(
+        "Reads back an asynchronous Git clone started by git_clone_repo. "
+        "action='status' returns job_status, created_by, start_time and end_time; "
+        "action='log' returns the clone's stdout or stderr (log_type); "
+        "action='errors' returns the workflow errors recorded against it. "
+        "git_clone_repo only submits the clone, so its response means 'accepted', "
+        "not 'finished' — this is the only way to learn whether it succeeded, and "
+        "a failed clone leaves an empty or partial folder whose later branch, "
+        "status and diff calls then fail for an unrelated-looking reason. "
+        "Identify the Git folder by file_id or file_path, inside workspace_id or "
+        "workspace_name."
+    ),
+    annotations={"readOnlyHint": True},
+)
+async def git_clone_status(
+    workspace_id: Optional[int] = Field(
+        default=None, description="Workspace ID holding the Git folder"),
+    workspace_name: Optional[str] = Field(
+        default=None, description="Workspace name, if workspace_id is not given"),
+    action: str = Field(
+        default="status", description="Action: status, log, or errors"),
+    file_id: Optional[int] = Field(
+        default=None, description="File ID of the Git folder (GIT_FOLDER type)"),
+    file_path: Optional[str] = Field(
+        default=None, description="Full path of the Git folder in the workspace"),
+    log_type: str = Field(
+        default="stdout",
+        description="Which log to read when action='log': stdout or stderr"),
+    last_n_lines: Optional[int] = Field(
+        default=None, ge=1,
+        description="Return only the last N lines when action='log'"),
+) -> str:
+    """Read the status, log or errors of a submitted Git clone."""
+    action = (action or "status").strip().lower()
+    if action not in _CLONE_ACTIONS:
+        return (
+            f"Error: Invalid action '{action}'. Hint: use one of "
+            f"{', '.join(_CLONE_ACTIONS)}."
+        )
+    if workspace_id is None and not workspace_name:
+        return "Error: Either workspace_id or workspace_name is required."
+    if file_id is None and not file_path:
+        return (
+            "Error: Either file_id or file_path is required to identify the Git "
+            "folder. Hint: browse_workspace_files lists the folders in a "
+            "workspace with their file ids."
+        )
+
+    params = _clone_target(workspace_id, workspace_name, file_id, file_path)
+    target = file_path or f"file_id {file_id}"
+
+    try:
+        async with YeeduClient() as client:
+            if action == "log":
+                log = (log_type or "stdout").strip().lower()
+                if log not in ("stdout", "stderr"):
+                    return (
+                        f"Error: Invalid log_type '{log_type}'. "
+                        "Hint: use stdout or stderr."
+                    )
+                if last_n_lines is not None:
+                    params["last_n_lines"] = last_n_lines
+                raw = await client.get_raw(
+                    f"/api/v1/workspace/files/git/clone/log/{log}", params=params)
+                text = raw.decode("utf-8", errors="replace").strip() if raw else ""
+
+                # The endpoint is declared text/plain for every variant, and is
+                # not: asked for the last N lines it sets application/json and
+                # wraps the log as {"last_n_lines": "..."} (the branch in
+                # `getGitCloneJobLogs`, services/GitService.js). Returned
+                # unwrapped, an empty log reads back as the literal text
+                # `{"last_n_lines":""}` -- which looks like a log line.
+                if last_n_lines is not None and text.startswith("{"):
+                    try:
+                        payload = json.loads(text)
+                    except ValueError:
+                        payload = None
+                    if isinstance(payload, dict) and "last_n_lines" in payload:
+                        text = str(payload["last_n_lines"] or "").strip()
+
+                text = _scrub_log(text)
+                if not text:
+                    return (
+                        f"No {log} output recorded for the clone of {target}. "
+                        "The query ran and the log is empty; this is an empty "
+                        f"result, not a failed call. git writes its progress to "
+                        "stderr, so a successful clone usually has no stdout at "
+                        "all — try log_type='stderr'. An empty stderr too means "
+                        "the clone may not have started yet; check "
+                        "git_clone_status(action='status')."
+                    )
+                return text
+
+            if action == "errors":
+                data = await client.get(
+                    "/api/v1/workspace/files/git/clone/workflow/errors",
+                    params=params)
+                rows = data.get("data") if isinstance(data, dict) else data
+                if not rows:
+                    return (
+                        f"No errors recorded against the clone of {target}. The "
+                        "query ran and returned 0 rows; this is an empty result, "
+                        "not a failed call."
+                    )
+                lines = ["error"]
+                lines += [str(r.get("error", r) if isinstance(r, dict) else r)
+                          for r in rows]
+                return "\n".join(lines)
+
+            data = await client.get(
+                "/api/v1/workspace/files/git/clone/status", params=params)
+            record = data[0] if isinstance(data, list) and data else data
+            if not isinstance(record, dict) or not record:
+                return f"No clone job found for {target}."
+            lines = ["field,value"]
+            for key in ("job_status", "created_by", "start_time", "end_time"):
+                if key in record:
+                    lines.append(f"{key},{record[key]}")
+            for key, value in record.items():
+                if key not in ("job_status", "created_by", "start_time", "end_time"):
+                    lines.append(f"{key},{value}")
+            return "\n".join(lines)
+
+    except Exception as e:
+        # A clone with nothing wrong with it has no workflow errors, and the
+        # API answers that with 404 "No workflow errors were found ...". Left
+        # to raise, the one call that asks "did this clone fail?" answers with
+        # an error of its own, and the hint sends the caller to re-check a
+        # file_id that was right -- a false alarm about a clean clone, and the
+        # inverse of the mistake worth guarding against.
+        if action == "errors" and is_empty_listing(e):
+            return (
+                f"No errors recorded against the clone of {target}. The query "
+                "ran and returned 0 rows; this is an empty result, not a "
+                "failed call. Read job_status with "
+                "git_clone_status(action='status') to see whether it finished."
+            )
+        return (
+            f"Error reading clone {action} for {target}: {str(e)}. HINT: Confirm "
+            "the file_id or file_path points at a GIT_FOLDER created by "
+            "git_clone_repo — browse_workspace_files lists them."
+        )
